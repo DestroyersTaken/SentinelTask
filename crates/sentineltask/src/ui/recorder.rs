@@ -132,7 +132,9 @@ impl SentinelApp {
         let idle = self.mode.is_idle();
         let has_doc = self.doc.as_ref().is_some_and(|d| !d.mac.events.is_empty());
         widgets::card(ui, &p, |ui| {
-            ui.horizontal(|ui| {
+            // Wraps the status text below the buttons when the window is
+            // narrow or the UI is zoomed in.
+            ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 12.0;
                 if !self.player_mode {
                     let r = widgets::big_action(
@@ -189,6 +191,8 @@ impl SentinelApp {
                 ui.add_space(8.0);
                 ui.vertical(|ui| {
                     ui.set_min_height(112.0);
+                    ui.set_min_width(240.0);
+                    ui.set_max_width(ui.available_width().max(240.0));
                     self.live_status(ui);
                 });
             });

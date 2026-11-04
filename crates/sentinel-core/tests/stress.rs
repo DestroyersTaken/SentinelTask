@@ -36,7 +36,16 @@ impl Rng {
     }
 }
 
-const KEYS: [u16; 8] = [0x41, 0x57, vk::LSHIFT, vk::LCONTROL, vk::LMENU, vk::SPACE, vk::UP, vk::F1 + 7];
+const KEYS: [u16; 8] = [
+    0x41,
+    0x57,
+    vk::LSHIFT,
+    vk::LCONTROL,
+    vk::LMENU,
+    vk::SPACE,
+    vk::UP,
+    vk::F1 + 7,
+];
 
 fn random_events(rng: &mut Rng, n: usize) -> Vec<Event> {
     let mut t = 0u64;
@@ -99,7 +108,9 @@ fn assert_invariants(events: &[Event], ctx: &str) {
                     buttons.push(button);
                 }
             }
-            EventKind::MouseButton { button, down: false, .. } => {
+            EventKind::MouseButton {
+                button, down: false, ..
+            } => {
                 let before = buttons.len();
                 buttons.retain(|b| *b != button);
                 assert!(buttons.len() < before, "{ctx}: orphan button-up at {i}");
@@ -217,7 +228,9 @@ fn random_playback_options_always_terminate_without_drift() {
                 0 => Repeat::Times {
                     count: 1 + rng.below(5) as u32,
                 },
-                1 => Repeat::Duration { secs: 1 + rng.below(30) },
+                1 => Repeat::Duration {
+                    secs: 1 + rng.below(30),
+                },
                 _ => Repeat::Times { count: 2 },
             },
             loop_delay_ms: rng.below(500),
@@ -255,7 +268,12 @@ fn random_playback_options_always_terminate_without_drift() {
 fn coordinate_math_holds_for_random_layouts() {
     let mut rng = Rng::new(42);
     for _ in 0..2000 {
-        let desk = Rect::new(rng.range(-8000, 0), rng.range(-4000, 0), rng.range(320, 16_000), rng.range(200, 8_000));
+        let desk = Rect::new(
+            rng.range(-8000, 0),
+            rng.range(-4000, 0),
+            rng.range(320, 16_000),
+            rng.range(200, 8_000),
+        );
         for _ in 0..20 {
             let x = rng.range(desk.x, desk.right() - 1);
             let y = rng.range(desk.y, desk.bottom() - 1);
@@ -367,4 +385,3 @@ fn huge_macros_are_fast() {
         s.len() as f64 / 1e6
     );
 }
-

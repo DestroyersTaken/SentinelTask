@@ -1365,12 +1365,30 @@ impl SentinelApp {
                 } else {
                     format!("{} record   ·   ", self.hotkey_text(HotkeyAction::Record))
                 };
-                let hint = format!(
+                let full = format!(
                     "{record}{} play/stop   ·   {} pause   ·   {} emergency stop",
                     self.hotkey_text(HotkeyAction::Play),
                     self.hotkey_text(HotkeyAction::Pause),
                     self.hotkey_text(HotkeyAction::EmergencyStop),
                 );
+                let short = format!("{} emergency stop", self.hotkey_text(HotkeyAction::EmergencyStop));
+                // Pick the longest hint that fits; never overlap the state text.
+                let font = egui::FontId::proportional(11.5);
+                let room = ui.available_width() - 12.0;
+                let fits = |t: &str| {
+                    ui.painter()
+                        .layout_no_wrap(t.to_string(), font.clone(), p.text_faint)
+                        .size()
+                        .x
+                        <= room
+                };
+                let hint = if fits(&full) {
+                    full
+                } else if fits(&short) {
+                    short
+                } else {
+                    String::new()
+                };
                 ui.label(RichText::new(hint).size(11.5).color(p.text_faint));
             });
         });

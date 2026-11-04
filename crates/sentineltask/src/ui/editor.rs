@@ -473,13 +473,17 @@ impl SentinelApp {
                 Stroke::new(if sel { 2.5 } else { 1.5 }, col),
             );
         }
-        painter.text(
-            pos2(inner.right(), inner.top()),
-            egui::Align2::RIGHT_TOP,
+        let label = painter.layout_no_wrap(
             format_duration_us(doc.mac.duration_us()),
             egui::FontId::proportional(11.0),
             p.text_faint,
         );
+        let label_rect = egui::Rect::from_min_size(
+            pos2(inner.right() - label.size().x - 6.0, inner.top() - 2.0),
+            label.size() + vec2(6.0, 2.0),
+        );
+        painter.rect_filled(label_rect, CornerRadius::same(4), p.card);
+        painter.galley(label_rect.min + vec2(3.0, 1.0), label, p.text_faint);
         if resp.clicked() {
             if let Some(pos) = resp.interact_pointer_pos() {
                 let t = ((pos.x - inner.left()) / inner.width()).clamp(0.0, 1.0) * dur;
