@@ -41,6 +41,7 @@ jobs:
         with:
           files: |
             dist/SentinelTask-*-setup.exe
+            dist/SentinelTask-*-installer.zip
             dist/SentinelTask-*-portable.zip
             dist/SHA256SUMS.txt
           generate_release_notes: true

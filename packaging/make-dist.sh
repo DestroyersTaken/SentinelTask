@@ -2,6 +2,7 @@
 # Build the distributable files into dist/:
 #   SentinelTask-<ver>-portable.zip   unzip-and-run, settings stay beside the exe
 #   SentinelTask-<ver>-setup.exe      per-user installer (no admin needed)
+#   SentinelTask-<ver>-installer.zip  the installer, zipped (browsers often block .exe)
 #   SHA256SUMS.txt
 #
 # Usage: packaging/make-dist.sh [path/to/SentinelTask.exe]
@@ -33,6 +34,9 @@ cp packaging/portable.txt "$STAGE/SentinelTask/portable.txt"
 makensis -V2 -DVERSION="$VERSION" -DSRCDIR="$(realpath "$STAGE/SentinelTask")" \
   -DDOCDIR="$(pwd)" -DOUTFILE="$(realpath "$DIST")/SentinelTask-$VERSION-setup.exe" \
   packaging/installer.nsi
+
+# The installer zipped too: many browsers and chat apps block a bare .exe.
+(cd "$DIST" && zip -q -9 "SentinelTask-$VERSION-installer.zip" "SentinelTask-$VERSION-setup.exe")
 
 rm -rf "$STAGE"
 (cd "$DIST" && sha256sum ./*.zip ./*.exe > SHA256SUMS.txt)
