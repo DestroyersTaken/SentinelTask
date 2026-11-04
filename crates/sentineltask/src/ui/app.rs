@@ -95,6 +95,11 @@ pub enum OpenTarget {
     NewRecording,
 }
 
+/// Window size of the compact (TinyTask-style) toolbar, in points.
+pub const COMPACT_SIZE: egui::Vec2 = egui::vec2(560.0, 92.0);
+/// Default size of the full window, in points.
+pub const FULL_SIZE: egui::Vec2 = egui::vec2(1040.0, 720.0);
+
 fn overlay_id() -> egui::ViewportId {
     egui::ViewportId::from_hash_of("sentinel-overlay")
 }
@@ -211,6 +216,9 @@ pub struct SentinelApp {
     overlay_data: Arc<parking_lot::Mutex<OverlayData>>,
     pub selftest: Option<super::selftest::SelfTest>,
     overlay_hardened_at: Instant,
+    size_attempts: u8,
+    size_retry_at: Instant,
+    size_target: Option<egui::Vec2>,
 }
 
 fn waker_for(ctx: &egui::Context) -> platform::Waker {
@@ -274,6 +282,9 @@ impl SentinelApp {
             overlay_data: Arc::default(),
             selftest: super::selftest::SelfTest::from_env(),
             overlay_hardened_at: Instant::now(),
+            size_attempts: 0,
+            size_retry_at: Instant::now(),
+            size_target: None,
         };
         // Start on a specific page (used for documentation screenshots).
         if let Ok(page) = std::env::var("SENTINEL_PAGE") {
@@ -957,21 +968,72 @@ impl SentinelApp {
             theme::apply(ctx, &self.palette, self.settings.ui.zoom);
             self.applied_theme = Some(key);
         }
+        self.enforce_window_size(ctx);
+    }
+
+    /// Compact mode must really be compact. A single resize request can be
+    /// undone on real Windows (e.g. by the DPI adjustment right after the
+    /// window appears, or when it is maximized or snapped), so the actual
+    /// size is checked every frame and the request repeated until it
+    /// sticks. The compact window is also not resizable.
+    fn enforce_window_size(&mut self, ctx: &egui::Context) {
         let compact = self.settings.ui.compact;
         if self.compact_applied != Some(compact) {
-            if compact {
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(560.0, 92.0)));
-                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
-            } else if self.compact_applied.is_some() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(vec2(1040.0, 720.0)));
-                ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(if self.settings.ui.always_on_top {
+            // Mode changed: start (re)applying. At startup the window is
+            // already created at the right size, but it is verified anyway.
+            let first = self.compact_applied.is_none();
+            self.compact_applied = Some(compact);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(!compact));
+            ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                if compact || self.settings.ui.always_on_top {
                     egui::WindowLevel::AlwaysOnTop
                 } else {
                     egui::WindowLevel::Normal
-                }));
-            }
-            self.compact_applied = Some(compact);
+                },
+            ));
+            self.size_target = if compact {
+                Some(COMPACT_SIZE)
+            } else if first {
+                None // full mode at startup: keep whatever size the user had
+            } else {
+                Some(FULL_SIZE)
+            };
+            self.size_attempts = 0;
+            // Give the Resizable change a frame to land before resizing.
+            self.size_retry_at = Instant::now();
         }
+        let Some(target) = self.size_target else { return };
+        if self.size_attempts >= 40 {
+            self.size_target = None;
+            return;
+        }
+        let (inner, maximized, fullscreen) = ctx.input(|i| {
+            let v = i.viewport();
+            (
+                v.inner_rect,
+                v.maximized.unwrap_or(false),
+                v.fullscreen.unwrap_or(false),
+            )
+        });
+        let fits = inner.is_some_and(|r| (r.width() - target.x).abs() <= 6.0 && (r.height() - target.y).abs() <= 6.0);
+        if fits && !maximized && !fullscreen {
+            self.size_target = None; // done
+            return;
+        }
+        ctx.request_repaint_after(Duration::from_millis(160));
+        if self.size_retry_at.elapsed() < Duration::from_millis(150) {
+            return;
+        }
+        self.size_retry_at = Instant::now();
+        self.size_attempts += 1;
+        if fullscreen {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
+        }
+        if maximized {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
+        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Resizable(!compact));
+        ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(target));
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {

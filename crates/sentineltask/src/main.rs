@@ -39,12 +39,29 @@ fn run_gui(launch: ui::app::LaunchOptions) -> ExitCode {
         width: 64,
         height: 64,
     };
+    // Open the window at the right size straight away (compact mode), rather
+    // than resizing it after it appears.
+    let saved = std::fs::read_to_string(paths::Paths::detect().settings_file())
+        .map(|s| sentinel_core::settings::Settings::from_json(&s))
+        .unwrap_or_default();
+    let start_compact = saved.ui.compact;
+    let start_on_top = saved.ui.always_on_top;
     let make_options = |renderer: eframe::Renderer| eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(&title)
             .with_app_id("SentinelTask")
-            .with_inner_size([1040.0, 720.0])
+            .with_inner_size(if start_compact {
+                ui::app::COMPACT_SIZE
+            } else {
+                ui::app::FULL_SIZE
+            })
             .with_min_inner_size([540.0, 92.0])
+            .with_resizable(!start_compact)
+            .with_window_level(if start_compact || start_on_top {
+                egui::WindowLevel::AlwaysOnTop
+            } else {
+                egui::WindowLevel::Normal
+            })
             .with_icon(icon.clone())
             .with_drag_and_drop(true),
         renderer,
