@@ -71,9 +71,9 @@ pub fn balance(events: &mut Vec<Event>) {
 /// nothing else (TinyTask-Linux fix #3: neighbouring events were deleted).
 ///
 /// Only the trailing run of events is considered (mouse motion is skipped
-/// over and kept). Within it, only presses of keys that belong to the chord
-/// *and are still held at the end* are removed; a complete earlier
-/// `Ctrl+C` that happens to share `Ctrl` with the hotkey is untouched.
+/// over and kept). Within it, presses of keys that belong to the chord are
+/// removed together with their releases; a complete earlier `Ctrl+C` that
+/// happens to share `Ctrl` with the hotkey is untouched.
 pub fn strip_trailing_hotkey(events: &mut Vec<Event>, hotkey: &Hotkey) {
     // Find the start of the trailing segment.
     let mut seg_start = events.len();
@@ -88,13 +88,10 @@ pub fn strip_trailing_hotkey(events: &mut Vec<Event>, hotkey: &Hotkey) {
     if seg_start == events.len() {
         return;
     }
-    // Keys whose last event in the whole recording is a press.
-    let mut last_state: BTreeMap<(u16, bool), bool> = BTreeMap::new();
-    for e in events.iter() {
-        if let EventKind::Key { key, down } = e.kind {
-            last_state.insert(key.identity(), down);
-        }
-    }
+    // Chord keys pressed inside the trailing segment belong to the stop
+    // chord: remove the press and its release. Releases of keys pressed
+    // *before* the segment (a real Ctrl+C sharing Ctrl) are kept.
+    let mut started_in_segment: Vec<(u16, bool)> = Vec::new();
     let mut idx = 0usize;
     events.retain(|e| {
         let i = idx;
@@ -104,7 +101,13 @@ pub fn strip_trailing_hotkey(events: &mut Vec<Event>, hotkey: &Hotkey) {
         }
         match e.kind {
             EventKind::Key { key, down: true } if hotkey.involves_vk(key.vk) => {
-                !last_state.get(&key.identity()).copied().unwrap_or(false)
+                if !started_in_segment.contains(&key.identity()) {
+                    started_in_segment.push(key.identity());
+                }
+                false
+            }
+            EventKind::Key { key, down: false } if hotkey.involves_vk(key.vk) => {
+                !started_in_segment.contains(&key.identity())
             }
             _ => true,
         }
@@ -309,6 +312,24 @@ mod tests {
         let mut e = vec![btn(1, true), btn(2, false), key(3, vk::LCONTROL, true)];
         strip_trailing_hotkey(&mut e, &hk);
         assert_eq!(e, vec![btn(1, true), btn(2, false)]);
+    }
+
+    #[test]
+    fn strip_removes_a_fully_released_stop_chord() {
+        // The user released Ctrl/Alt/Shift before capture stopped.
+        let hk = Hotkey::with(true, true, true, 0x52);
+        let mut e = vec![
+            key(1, 0x85, true),
+            key(2, 0x85, false),
+            key(3, vk::LCONTROL, true),
+            key(4, vk::LMENU, true),
+            key(5, vk::LSHIFT, true),
+            key(6, vk::LSHIFT, false),
+            key(7, vk::LMENU, false),
+            key(8, vk::LCONTROL, false),
+        ];
+        strip_trailing_hotkey(&mut e, &hk);
+        assert_eq!(e, vec![key(1, 0x85, true), key(2, 0x85, false)]);
     }
 
     #[test]

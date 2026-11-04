@@ -603,7 +603,10 @@ impl SentinelApp {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(idle, egui::Button::new("Restore TinyTask-style defaults"))
+                    .add_enabled(
+                        idle && self.capturing_hotkey.is_none(),
+                        egui::Button::new("Restore TinyTask-style defaults"),
+                    )
                     .clicked()
                 {
                     self.settings.hotkeys = Default::default();

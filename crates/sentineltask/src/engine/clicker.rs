@@ -74,14 +74,29 @@ pub fn start(cfg: ClickerConfig, waker: Waker) -> ClickerHandle {
         .spawn(move || {
             platform::boost_thread_priority(true);
             let mut sleeper = Sleeper::new();
-            let mut inj = Injector::new(MouseMode::Absolute);
-            let start = platform::now_us() + 50_000; // let the hotkey keys settle
+            // A fixed spot is clicked with the position inside the same input
+            // event as the button (atomic). "Wherever the cursor is" never
+            // moves the mouse, so it can't fight the user's hand.
+            let fixed = match cfg.location {
+                ClickLocation::Fixed { x, y } => Some((x, y)),
+                ClickLocation::Cursor => None,
+            };
+            let mut inj = Injector::new(if fixed.is_some() {
+                MouseMode::Absolute
+            } else {
+                MouseMode::Relative
+            });
+            // Wait for the user to let go of the hotkey's modifiers FIRST, then
+            // anchor the schedule — otherwise the wait would be "caught up"
+            // with a burst of clicks.
             platform::wait_modifiers_released(std::time::Duration::from_secs(2));
+            let origin = platform::now_us() + 50_000;
+            let interval = cfg.interval_us();
             let hold = cfg.hold_us();
+            let mut due = origin;
             let mut k: u64 = 0;
             loop {
-                let due = cfg.due_us(start, k);
-                if !cfg.allows(start, k, due) || s2.load(Ordering::SeqCst) {
+                if !cfg.allows(origin, k, due) || s2.load(Ordering::SeqCst) {
                     break;
                 }
                 // Sleep in short slices so Stop is instant.
@@ -91,10 +106,13 @@ pub fn start(cfg: ClickerConfig, waker: Waker) -> ClickerHandle {
                     }
                     sleeper.wait_until(due.min(platform::now_us() + 20_000));
                 }
-                if let ClickLocation::Fixed { x, y } = cfg.location {
-                    inj.move_to(x, y);
+                // If the PC stalled for more than one interval, resume from now
+                // instead of firing the missed clicks in a burst.
+                let now = platform::now_us();
+                if now > due + interval {
+                    due = now;
                 }
-                let (cx, cy) = platform::cursor_pos();
+                let (cx, cy) = fixed.unwrap_or_else(platform::cursor_pos);
                 match cfg.action {
                     ClickAction::Mouse { button, double } => {
                         let presses = if double { 2 } else { 1 };
@@ -138,6 +156,7 @@ pub fn start(cfg: ClickerConfig, waker: Waker) -> ClickerHandle {
                     }
                 }
                 k += 1;
+                due += interval;
                 c2.store(k, Ordering::Relaxed);
                 if k % 10 == 0 {
                     waker();

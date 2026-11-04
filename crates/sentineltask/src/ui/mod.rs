@@ -4,6 +4,7 @@ pub mod app;
 pub mod editor;
 pub mod pages;
 pub mod recorder;
+pub mod selftest;
 pub mod theme;
 pub mod widgets;
 

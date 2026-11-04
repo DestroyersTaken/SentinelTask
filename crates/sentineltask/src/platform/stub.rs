@@ -163,9 +163,6 @@ impl Injector {
             self.pressed.apply(&e);
         }
     }
-    pub fn move_to(&mut self, x: i32, y: i32) {
-        self.sent.push(EventKind::MouseMove { x, y });
-    }
 }
 
 impl Drop for Injector {
@@ -226,3 +223,9 @@ pub fn set_virtual_key_injection(_on: bool) {}
 pub fn point_is_own_window(_x: i32, _y: i32) -> bool {
     false
 }
+
+pub fn simulate_user_keys(_keys: &[(u16, bool)]) {}
+
+pub const OVERLAY_TITLE: &str = "SentinelTask status";
+
+pub fn make_overlay_unfocusable() {}

@@ -85,10 +85,14 @@ fn run_gui(launch: ui::app::LaunchOptions) -> ExitCode {
             }
         }
     }
-    platform::show_error_box(
-        "SentinelTask",
-        &format!("SentinelTask could not open its window:\n\n{last_err}"),
-    );
+    if let Ok(out) = std::env::var("SENTINEL_SELFTEST") {
+        let _ = std::fs::write(out, format!("FAIL: could not open a window: {last_err}"));
+    } else {
+        platform::show_error_box(
+            "SentinelTask",
+            &format!("SentinelTask could not open its window:\n\n{last_err}"),
+        );
+    }
     ExitCode::FAILURE
 }
 

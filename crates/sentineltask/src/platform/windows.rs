@@ -544,13 +544,6 @@ impl Injector {
         self.last_abs = Some((x, y));
     }
 
-    /// Move the cursor to (x, y) (no-op if already sent there).
-    fn ensure_at(&mut self, x: i32, y: i32) {
-        if self.last_abs != Some((x, y)) {
-            self.move_abs(x, y);
-        }
-    }
-
     fn sync_global(&self) {
         *GLOBAL_HELD.lock() = Some(self.pressed.clone());
     }
@@ -647,11 +640,6 @@ impl Injector {
             });
         }
         self.sync_global();
-    }
-
-    /// Current cursor position (for relative-mode clicks and the clicker).
-    pub fn move_to(&mut self, x: i32, y: i32) {
-        self.ensure_at(x, y);
     }
 }
 
@@ -833,6 +821,18 @@ fn match_hotkey(vk: u16) -> Option<HotkeyAction> {
         .map(|(a, _)| a)
 }
 
+/// A hotkey that ends a recording stops capture at that exact instant, so
+/// releasing the chord's modifier keys is never recorded (the UI thread may
+/// take a moment to react).
+fn stop_capture_for_hotkey(a: HotkeyAction) {
+    if matches!(
+        a,
+        HotkeyAction::Record | HotkeyAction::Play | HotkeyAction::EmergencyStop
+    ) {
+        CAPTURING.store(false, Ordering::SeqCst);
+    }
+}
+
 fn now_ms() -> u64 {
     now_us() / 1000
 }
@@ -853,8 +853,9 @@ fn emit(ev: PlatformEvent) {
         let key = (a.id() as u64) << 48 | now;
         let prev = LAST_HOTKEY.swap(key, Ordering::Relaxed);
         if prev >> 48 == a.id() as u64 && now.saturating_sub(prev & 0xFFFF_FFFF_FFFF) < 250 {
-            return;
+            return; // duplicate: must not act at all (not even stop capture)
         }
+        stop_capture_for_hotkey(a);
     }
     if let Some(s) = SHARED.get() {
         let _ = s.event_tx.send(ev);
@@ -903,9 +904,15 @@ unsafe fn point_is_own_window_raw(pt: POINT) -> bool {
     ex & WS_EX_TRANSPARENT == 0
 }
 
+/// SentinelTask's own (non-minimized) window is in front: keys typed now go
+/// to SentinelTask itself and are not part of a macro.
 unsafe fn foreground_is_own() -> bool {
     let hwnd = GetForegroundWindow();
-    if hwnd.is_null() {
+    if hwnd.is_null() || IsIconic(hwnd) != 0 {
+        return false;
+    }
+    // The click-through status overlay never counts as "SentinelTask in front".
+    if GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TRANSPARENT != 0 {
         return false;
     }
     let mut pid = 0u32;
@@ -1903,5 +1910,59 @@ mod real_windows {
         assert_eq!(wait_cursor(desk.x + 70, desk.y + 80), (desk.x + 70, desk.y + 80));
         assert!(!key_down_now(vk::F1 + 20), "F21 left held down after playback");
         assert!(GLOBAL_HELD.lock().is_none());
+    }
+}
+
+/// Send key presses that look like they came from the user (not tagged as
+/// SentinelTask's own). Only used by the GUI self-test.
+pub fn simulate_user_keys(keys: &[(u16, bool)]) {
+    for &(code, down) in keys {
+        let scan = unsafe { MapVirtualKeyW(code as u32, MAPVK_VK_TO_VSC) } as u16;
+        let ext = if sentinel_core::keys::is_extended_vk(code) {
+            KEYEVENTF_EXTENDEDKEY
+        } else {
+            0
+        };
+        let i = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: code,
+                    wScan: scan,
+                    dwFlags: ext | if down { 0 } else { KEYEVENTF_KEYUP },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        unsafe { SendInput(1, &i, size_of::<INPUT>() as i32) };
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+/// Title of the status overlay window (see `ui::app`).
+pub const OVERLAY_TITLE: &str = "SentinelTask status";
+
+/// Make the status overlay impossible to activate: when the main window is
+/// minimized Windows activates the next window in z-order, which could be
+/// the always-on-top overlay — and then the user's keystrokes would go to it
+/// instead of their game. WS_EX_NOACTIVATE prevents that.
+pub fn make_overlay_unfocusable() {
+    let title = wide(OVERLAY_TITLE);
+    unsafe {
+        let hwnd = FindWindowW(null(), title.as_ptr());
+        if hwnd.is_null() {
+            return;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid != own_pid() {
+            return;
+        }
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        let want = ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
+        if want != ex {
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want as isize);
+        }
     }
 }

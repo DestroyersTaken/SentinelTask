@@ -95,6 +95,75 @@ pub enum OpenTarget {
     NewRecording,
 }
 
+fn overlay_id() -> egui::ViewportId {
+    egui::ViewportId::from_hash_of("sentinel-overlay")
+}
+
+/// What the status overlay shows; shared with its deferred viewport.
+#[derive(Clone)]
+struct OverlayData {
+    summary: String,
+    stop_hint: String,
+    accent: Color32,
+    progress: Option<f32>,
+    palette: Palette,
+}
+
+impl Default for OverlayData {
+    fn default() -> Self {
+        Self {
+            summary: String::new(),
+            stop_hint: String::new(),
+            accent: theme::DARK.accent,
+            progress: None,
+            palette: theme::DARK,
+        }
+    }
+}
+
+fn draw_overlay(ui: &mut egui::Ui, d: &OverlayData) {
+    let p = d.palette;
+    egui::CentralPanel::default()
+        .frame(egui::Frame::new().fill(Color32::TRANSPARENT))
+        .show(ui, |ui| {
+            let rect = ui.max_rect();
+            let painter = ui.painter();
+            painter.rect(
+                rect.shrink(1.0),
+                CornerRadius::same(12),
+                p.card.gamma_multiply(0.96),
+                Stroke::new(1.0, d.accent.gamma_multiply(0.8)),
+                StrokeKind::Inside,
+            );
+            let bar = egui::Rect::from_min_size(rect.left_top() + vec2(1.0, 10.0), vec2(4.0, rect.height() - 20.0));
+            painter.rect_filled(bar, CornerRadius::same(2), d.accent);
+            painter.text(
+                rect.left_top() + vec2(16.0, 18.0),
+                Align2::LEFT_CENTER,
+                &d.summary,
+                egui::FontId::proportional(14.0),
+                p.text,
+            );
+            painter.text(
+                rect.left_top() + vec2(16.0, 38.0),
+                Align2::LEFT_CENTER,
+                &d.stop_hint,
+                egui::FontId::proportional(11.5),
+                p.text_faint,
+            );
+            if let Some(pr) = d.progress {
+                let track = egui::Rect::from_min_size(
+                    pos2(rect.left() + 16.0, rect.bottom() - 9.0),
+                    vec2(rect.width() - 32.0, 3.0),
+                );
+                painter.rect_filled(track, CornerRadius::same(2), p.raised);
+                let mut fill = track;
+                fill.set_width(track.width() * pr);
+                painter.rect_filled(fill, CornerRadius::same(2), d.accent);
+            }
+        });
+}
+
 /// Launch-time options from the command line / embedded payload.
 #[derive(Default)]
 pub struct LaunchOptions {
@@ -138,6 +207,10 @@ pub struct SentinelApp {
     pub last_run: Option<String>,
     window_restore_needed: bool,
     compact_applied: Option<bool>,
+    watch_armed: bool,
+    overlay_data: Arc<parking_lot::Mutex<OverlayData>>,
+    pub selftest: Option<super::selftest::SelfTest>,
+    overlay_hardened_at: Instant,
 }
 
 fn waker_for(ctx: &egui::Context) -> platform::Waker {
@@ -197,6 +270,10 @@ impl SentinelApp {
             last_run: None,
             window_restore_needed: false,
             compact_applied: None,
+            watch_armed: false,
+            overlay_data: Arc::default(),
+            selftest: super::selftest::SelfTest::from_env(),
+            overlay_hardened_at: Instant::now(),
         };
         // Start on a specific page (used for documentation screenshots).
         if let Ok(page) = std::env::var("SENTINEL_PAGE") {
@@ -580,10 +657,7 @@ impl SentinelApp {
             keep_awake: self.settings.safety.prevent_sleep,
             wait_for_modifiers: by_hotkey,
         };
-        self.service.set_activity_watch(
-            self.settings.safety.stop_on_user_mouse,
-            self.settings.safety.stop_on_user_key,
-        );
+        self.watch_armed = false;
         self.minimize_if_wanted(ctx);
         let handle = player::start(req, waker_for(ctx));
         self.mode = Mode::Playing { handle };
@@ -597,6 +671,23 @@ impl SentinelApp {
         }
     }
 
+    /// "Stop when I touch the mouse/keyboard" must only be armed while the
+    /// macro is actually running — not during the countdown (when you are
+    /// switching windows) or while paused (when you may need the mouse).
+    fn update_activity_watch(&mut self) {
+        let want = matches!(&self.mode, Mode::Playing { handle } if handle.status().state == RunState::Playing);
+        if want != self.watch_armed {
+            self.watch_armed = want;
+            let s = &self.settings.safety;
+            if want {
+                self.service
+                    .set_activity_watch(s.stop_on_user_mouse, s.stop_on_user_key);
+            } else {
+                self.service.set_activity_watch(false, false);
+            }
+        }
+    }
+
     fn finish_playback_if_done(&mut self, ctx: &egui::Context) {
         let done = matches!(&self.mode, Mode::Playing { handle } if handle.is_finished());
         if !done {
@@ -606,6 +697,7 @@ impl SentinelApp {
             return;
         };
         self.service.set_activity_watch(false, false);
+        self.watch_armed = false;
         let s = handle.join();
         self.restore_window(ctx);
         let summary = format!(
@@ -926,6 +1018,11 @@ impl SentinelApp {
 
     fn handle_close(&mut self, ctx: &egui::Context) {
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close {
+            // Closing mid-recording keeps what was recorded (it is saved to
+            // the library like any other recording).
+            if matches!(self.mode, Mode::Recording { .. } | Mode::RecordCountdown { .. }) {
+                self.stop_recording(ctx, None);
+            }
             if self.has_unsaved_changes() {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 self.modal = Some(Modal::UnsavedOnClose);
@@ -950,10 +1047,13 @@ impl SentinelApp {
 }
 
 impl eframe::App for SentinelApp {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        let ctx = ui.ctx().clone();
-        self.apply_theme_if_needed(&ctx);
-        self.handle_platform_events(&ctx);
+    /// Everything that is not drawing. eframe calls this before every frame
+    /// AND while the window is minimized or hidden (when `ui` is not called
+    /// at all), so hotkeys, the emergency stop, recording and playback keep
+    /// working when SentinelTask is minimized.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_platform_events(ctx);
+        self.drive_selftest(ctx);
         self.poll_environment();
 
         // Countdown → start recording.
@@ -966,11 +1066,33 @@ impl eframe::App for SentinelApp {
             }
         }
         self.drain_capture();
-        self.finish_playback_if_done(&ctx);
+        self.update_activity_watch();
+        self.finish_playback_if_done(ctx);
         self.finish_clicker_if_done();
+        self.handle_close(ctx);
+
+        if self.settings_dirty && self.settings_saved_at.elapsed() > Duration::from_secs(1) {
+            self.save_settings_now();
+        }
+
+        let busy = !self.mode.is_idle();
+        if busy {
+            // Keep the click-through status overlay updating even while the
+            // main window is minimized.
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
+        }
+        ctx.request_repaint_after(if busy {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_millis(700)
+        });
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.apply_theme_if_needed(&ctx);
         self.handle_shortcuts(&ctx);
         self.handle_dropped_files(&ctx);
-        self.handle_close(&ctx);
 
         let p = self.palette;
         if self.settings.ui.compact {
@@ -982,17 +1104,6 @@ impl eframe::App for SentinelApp {
         self.overlay(&ctx);
         self.show_modal(&ctx);
         self.show_toasts(&ctx, &p);
-
-        if self.settings_dirty && self.settings_saved_at.elapsed() > Duration::from_secs(1) {
-            self.save_settings_now();
-        }
-
-        let busy = !self.mode.is_idle();
-        ctx.request_repaint_after(if busy {
-            Duration::from_millis(100)
-        } else {
-            Duration::from_millis(700)
-        });
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
@@ -1369,8 +1480,19 @@ impl SentinelApp {
             OverlayCorner::BottomLeft => pos2(margin, sh - size.y - margin - 48.0),
             OverlayCorner::BottomRight => pos2(sw - size.x - margin, sh - size.y - margin - 48.0),
         };
+        // The overlay draws from shared state in its own (deferred) pass.
+        // An immediate viewport would run inside the main window's pass,
+        // and eframe panics if that pass can't create the overlay window
+        // (it happens while the main window is minimized).
+        *self.overlay_data.lock() = OverlayData {
+            summary,
+            stop_hint,
+            accent,
+            progress,
+            palette: p,
+        };
         let builder = egui::ViewportBuilder::default()
-            .with_title("SentinelTask status")
+            .with_title(platform::OVERLAY_TITLE)
             .with_inner_size(size)
             .with_position(pos)
             .with_decorations(false)
@@ -1380,54 +1502,16 @@ impl SentinelApp {
             .with_mouse_passthrough(true)
             .with_taskbar(false)
             .with_active(false);
-        ctx.show_viewport_immediate(
-            egui::ViewportId::from_hash_of("sentinel-overlay"),
-            builder,
-            move |ui, _class| {
-                egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(Color32::TRANSPARENT))
-                    .show(ui, |ui| {
-                        let rect = ui.max_rect();
-                        let painter = ui.painter();
-                        painter.rect(
-                            rect.shrink(1.0),
-                            CornerRadius::same(12),
-                            p.card.gamma_multiply(0.96),
-                            Stroke::new(1.0, accent.gamma_multiply(0.8)),
-                            StrokeKind::Inside,
-                        );
-                        let bar = egui::Rect::from_min_size(
-                            rect.left_top() + vec2(1.0, 10.0),
-                            vec2(4.0, rect.height() - 20.0),
-                        );
-                        painter.rect_filled(bar, CornerRadius::same(2), accent);
-                        painter.text(
-                            rect.left_top() + vec2(16.0, 18.0),
-                            Align2::LEFT_CENTER,
-                            &summary,
-                            egui::FontId::proportional(14.0),
-                            p.text,
-                        );
-                        painter.text(
-                            rect.left_top() + vec2(16.0, 38.0),
-                            Align2::LEFT_CENTER,
-                            &stop_hint,
-                            egui::FontId::proportional(11.5),
-                            p.text_faint,
-                        );
-                        if let Some(pr) = progress {
-                            let track = egui::Rect::from_min_size(
-                                pos2(rect.left() + 16.0, rect.bottom() - 9.0),
-                                vec2(rect.width() - 32.0, 3.0),
-                            );
-                            painter.rect_filled(track, CornerRadius::same(2), p.raised);
-                            let mut fill = track;
-                            fill.set_width(track.width() * pr);
-                            painter.rect_filled(fill, CornerRadius::same(2), accent);
-                        }
-                    });
-            },
-        );
+        let data = self.overlay_data.clone();
+        ctx.show_viewport_deferred(overlay_id(), builder, move |ui, _class| {
+            let d = data.lock().clone();
+            draw_overlay(ui, &d);
+        });
+        ctx.request_repaint_of(overlay_id());
+        if self.overlay_hardened_at.elapsed() > Duration::from_millis(500) {
+            self.overlay_hardened_at = Instant::now();
+            platform::make_overlay_unfocusable();
+        }
     }
 
     fn show_toasts(&mut self, ctx: &egui::Context, p: &Palette) {
