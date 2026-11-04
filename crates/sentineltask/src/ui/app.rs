@@ -216,9 +216,12 @@ pub struct SentinelApp {
     overlay_data: Arc<parking_lot::Mutex<OverlayData>>,
     pub selftest: Option<super::selftest::SelfTest>,
     overlay_hardened_at: Instant,
+    overlay_hardened: bool,
     size_attempts: u8,
     size_retry_at: Instant,
     size_target: Option<egui::Vec2>,
+    /// Clicks made by the last auto-clicker run.
+    pub last_clicker_count: Option<u64>,
 }
 
 fn waker_for(ctx: &egui::Context) -> platform::Waker {
@@ -282,9 +285,11 @@ impl SentinelApp {
             overlay_data: Arc::default(),
             selftest: super::selftest::SelfTest::from_env(),
             overlay_hardened_at: Instant::now(),
+            overlay_hardened: false,
             size_attempts: 0,
             size_retry_at: Instant::now(),
             size_target: None,
+            last_clicker_count: None,
         };
         // Start on a specific page (used for documentation screenshots).
         if let Ok(page) = std::env::var("SENTINEL_PAGE") {
@@ -332,7 +337,7 @@ impl SentinelApp {
         self.settings_dirty = true;
     }
 
-    fn save_settings_now(&mut self) {
+    pub fn save_settings_now(&mut self) {
         if self.player_mode {
             return;
         }
@@ -760,6 +765,7 @@ impl SentinelApp {
         if done {
             if let Mode::Clicking { handle } = std::mem::replace(&mut self.mode, Mode::Idle) {
                 let n = handle.join();
+                self.last_clicker_count = Some(n);
                 self.toast(ToastKind::Info, format!("Auto-clicker stopped after {n} clicks."));
             }
         }
@@ -1007,14 +1013,20 @@ impl SentinelApp {
             self.size_target = None;
             return;
         }
-        let (inner, maximized, fullscreen) = ctx.input(|i| {
+        let (inner, maximized, fullscreen, minimized) = ctx.input(|i| {
             let v = i.viewport();
             (
                 v.inner_rect,
                 v.maximized.unwrap_or(false),
                 v.fullscreen.unwrap_or(false),
+                v.minimized.unwrap_or(false),
             )
         });
+        if minimized {
+            // Can't (and shouldn't) resize a minimized window; try again
+            // once it is restored.
+            return;
+        }
         let fits = inner.is_some_and(|r| (r.width() - target.x).abs() <= 6.0 && (r.height() - target.y).abs() <= 6.0);
         if fits && !maximized && !fullscreen {
             self.size_target = None; // done
@@ -1517,6 +1529,7 @@ impl SentinelApp {
     fn overlay(&mut self, ctx: &egui::Context) {
         let corner = self.settings.ui.overlay;
         if self.mode.is_idle() || corner == OverlayCorner::Hidden {
+            self.overlay_hardened = false;
             return;
         }
         let p = self.palette;
@@ -1570,9 +1583,11 @@ impl SentinelApp {
             draw_overlay(ui, &d);
         });
         ctx.request_repaint_of(overlay_id());
-        if self.overlay_hardened_at.elapsed() > Duration::from_millis(500) {
+        // Patch the overlay's window style as soon as it exists (and
+        // re-check now and then), so it can never take keyboard focus.
+        if !self.overlay_hardened || self.overlay_hardened_at.elapsed() > Duration::from_secs(2) {
             self.overlay_hardened_at = Instant::now();
-            platform::make_overlay_unfocusable();
+            self.overlay_hardened = platform::make_overlay_unfocusable();
         }
     }
 

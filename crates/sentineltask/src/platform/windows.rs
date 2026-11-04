@@ -783,8 +783,11 @@ static HOTKEY_HELD_AT: AtomicU64 = AtomicU64::new(0);
 /// Longer than the slowest Windows keyboard repeat delay (1 s), so a held
 /// marker whose key-up was somehow missed can never swallow a later press.
 const HELD_STALE_MS: u64 = 1_100;
-/// (action id << 48) | milliseconds of the last hotkey emitted, for dedupe.
+/// (action id << 56) | (source << 48) | milliseconds of the last hotkey
+/// emitted, for de-duplicating the hook and RegisterHotKey paths.
 static LAST_HOTKEY: AtomicU64 = AtomicU64::new(0);
+const SRC_HOOK: u64 = 1;
+const SRC_WM_HOTKEY: u64 = 2;
 
 const ACTIVITY_THRESHOLD: i64 = 40;
 /// `RAWMOUSE.usFlags` bit for absolute (tablet / remote desktop) motion.
@@ -846,17 +849,30 @@ fn hotkey_vk_set(code: u16) -> bool {
 /// lock-free channel send and posts a message; the UI wake-up happens later
 /// in the service window procedure.
 fn emit(ev: PlatformEvent) {
-    if let PlatformEvent::Hotkey(a) = ev {
-        // The same hotkey can arrive through both the keyboard hook and
-        // RegisterHotKey in rare cases; never act on it twice.
-        let now = now_ms() & 0xFFFF_FFFF_FFFF;
-        let key = (a.id() as u64) << 48 | now;
-        let prev = LAST_HOTKEY.swap(key, Ordering::Relaxed);
-        if prev >> 48 == a.id() as u64 && now.saturating_sub(prev & 0xFFFF_FFFF_FFFF) < 250 {
-            return; // duplicate: must not act at all (not even stop capture)
-        }
-        stop_capture_for_hotkey(a);
+    if let PlatformEvent::Hotkey(_) = ev {
+        debug_assert!(false, "hotkeys go through emit_hotkey");
     }
+    emit_raw(ev);
+}
+
+/// A hotkey from one of the two detection paths. The same key press can
+/// (rarely) arrive through both the keyboard hook and RegisterHotKey; that
+/// copy is dropped. Two genuine presses — both from the same path — are
+/// never merged, however quickly they follow each other.
+fn emit_hotkey(a: HotkeyAction, source: u64) {
+    let now = now_ms() & 0xFFFF_FFFF_FFFF;
+    let key = (a.id() as u64) << 56 | source << 48 | now;
+    let prev = LAST_HOTKEY.swap(key, Ordering::Relaxed);
+    let same_action = prev >> 56 == a.id() as u64;
+    let other_source = (prev >> 48) & 0xFF != source;
+    if same_action && other_source && now.saturating_sub(prev & 0xFFFF_FFFF_FFFF) < 250 {
+        return; // duplicate: must not act at all (not even stop capture)
+    }
+    stop_capture_for_hotkey(a);
+    emit_raw(PlatformEvent::Hotkey(a));
+}
+
+fn emit_raw(ev: PlatformEvent) {
     if let Some(s) = SHARED.get() {
         let _ = s.event_tx.send(ev);
     }
@@ -980,7 +996,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                 if let Some(a) = match_hotkey(vk_code) {
                     HOTKEY_HELD_AT.store(now_ms(), Ordering::Relaxed);
                     HOTKEY_HELD.store(vk_code as u32, Ordering::Relaxed);
-                    emit(PlatformEvent::Hotkey(a));
+                    emit_hotkey(a, SRC_HOOK);
                     return 1;
                 }
             }
@@ -1308,7 +1324,7 @@ unsafe extern "system" fn service_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
     match msg {
         WM_HOTKEY => {
             if let Some(a) = HotkeyAction::from_id(wparam as i32) {
-                emit(PlatformEvent::Hotkey(a));
+                emit_hotkey(a, SRC_WM_HOTKEY);
             }
             0
         }
@@ -1950,22 +1966,59 @@ pub const OVERLAY_TITLE: &str = "SentinelTask status";
 /// minimized Windows activates the next window in z-order, which could be
 /// the always-on-top overlay — and then the user's keystrokes would go to it
 /// instead of their game. WS_EX_NOACTIVATE prevents that.
-pub fn make_overlay_unfocusable() {
+pub fn make_overlay_unfocusable() -> bool {
     let title = wide(OVERLAY_TITLE);
     unsafe {
         let hwnd = FindWindowW(null(), title.as_ptr());
         if hwnd.is_null() {
-            return;
+            return false;
         }
         let mut pid = 0u32;
         GetWindowThreadProcessId(hwnd, &mut pid);
         if pid != own_pid() {
-            return;
+            return false;
         }
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
         let want = ex | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW;
         if want != ex {
             SetWindowLongPtrW(hwnd, GWL_EXSTYLE, want as isize);
         }
+        true
+    }
+}
+
+/// Whether a key is physically/logically down right now (self-test checks).
+pub fn key_is_down(code: u16) -> bool {
+    key_down_now(code)
+}
+
+/// State of the status overlay window, for the self-test:
+/// `(exists, never_activates, click_through, is_foreground)`.
+pub fn overlay_window_state() -> (bool, bool, bool, bool) {
+    let title = wide(OVERLAY_TITLE);
+    unsafe {
+        let hwnd = FindWindowW(null(), title.as_ptr());
+        if hwnd.is_null() {
+            return (false, false, false, false);
+        }
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        (
+            true,
+            ex & WS_EX_NOACTIVATE != 0,
+            ex & WS_EX_TRANSPARENT != 0,
+            GetForegroundWindow() == hwnd,
+        )
+    }
+}
+
+/// Running under Wine (used only to relax self-test checks that depend on
+/// real Windows window-manager behaviour).
+pub fn running_under_wine() -> bool {
+    let ntdll = wide("ntdll.dll");
+    unsafe {
+        let h = GetModuleHandleW(ntdll.as_ptr());
+        !h.is_null()
+            && windows_sys::Win32::System::LibraryLoader::GetProcAddress(h, c"wine_get_version".as_ptr().cast())
+                .is_some()
     }
 }

@@ -40,14 +40,14 @@ jobs:
           if ($p.ExitCode -ne 0) { Write-Error "exit code $($p.ExitCode)"; exit 1 }
           $p = Start-Process -FilePath target/release/SentinelTask.exe -ArgumentList 'info','does-not-exist.stmacro' -Wait -PassThru -NoNewWindow
           if ($p.ExitCode -ne 1) { Write-Error "expected exit code 1 for a missing file, got $($p.ExitCode)"; exit 1 }
-      - name: GUI self-test (minimized hotkeys, overlay, emergency stop, record hotkey)
+      - name: GUI self-test (15 real-input scenarios: hotkeys, minimized, pause, rebind, clicker, compact, files...)
         shell: pwsh
         run: |
           $out = Join-Path $env:RUNNER_TEMP 'selftest.txt'
           $env:SENTINEL_SELFTEST = $out
           $p = Start-Process -FilePath target/release/SentinelTask.exe -PassThru
-          if (-not $p.WaitForExit(120000)) { Stop-Process -Id $p.Id -Force; Write-Error 'self-test hung'; exit 1 }
-          if (Test-Path $out) { Get-Content $out } else { Write-Output 'no result file' }
+          if (-not $p.WaitForExit(330000)) { Stop-Process -Id $p.Id -Force; Write-Error 'self-test hung'; exit 1 }
+          if (Test-Path $out) { Get-Content $out } else { Write-Output "no result file" }
           $log = Join-Path $env:LOCALAPPDATA 'SentinelTask\logs\sentineltask.log'
           if (Test-Path $log) { Get-Content $log -Tail 30 }
           if ($p.ExitCode -ne 0) { Write-Error "self-test failed (exit $($p.ExitCode))"; exit 1 }

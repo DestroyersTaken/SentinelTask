@@ -228,4 +228,18 @@ pub fn simulate_user_keys(_keys: &[(u16, bool)]) {}
 
 pub const OVERLAY_TITLE: &str = "SentinelTask status";
 
-pub fn make_overlay_unfocusable() {}
+pub fn make_overlay_unfocusable() -> bool {
+    true
+}
+
+pub fn key_is_down(_code: u16) -> bool {
+    false
+}
+
+pub fn overlay_window_state() -> (bool, bool, bool, bool) {
+    (false, false, false, false)
+}
+
+pub fn running_under_wine() -> bool {
+    false
+}
