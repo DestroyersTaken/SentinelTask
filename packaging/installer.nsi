@@ -1,6 +1,6 @@
 ; SentinelTask Windows installer (NSIS 3, Modern UI 2).
 ;
-; Build:  makensis -DVERSION=1.0.0 -DSRCDIR=<folder with SentinelTask.exe> -DOUTFILE=<setup.exe> installer.nsi
+; Build:  makensis -DVERSION=1.1.0 -DSRCDIR=<folder with SentinelTask.exe> -DOUTFILE=<setup.exe> installer.nsi
 ;
 ; Design choices:
 ; * Per-user install (%LOCALAPPDATA%\Programs\SentinelTask) — no UAC prompt,
@@ -10,6 +10,10 @@
 ;   recursively, so choosing an odd install folder can't delete user data.
 ;   Macros and settings are kept.
 ; * Detects a running SentinelTask (named mutex) before replacing files.
+; * Auto-update: SentinelTask runs this installer as `setup.exe /S /UPDATE`
+;   (plus `/RELAUNCH` to start the new version afterwards). Update mode
+;   waits for SentinelTask to close instead of asking, and keeps the
+;   shortcut and file-association choices of the existing install.
 
 ; SentinelTask is x64-only, so the installer is a native 64-bit program too
 ; (no WOW64 registry/file redirection surprises).
@@ -18,7 +22,7 @@ ManifestDPIAware true
 SetCompressor /SOLID lzma
 
 !ifndef VERSION
-  !define VERSION "1.0.0"
+  !define VERSION "1.1.0"
 !endif
 !ifndef SRCDIR
   !define SRCDIR "..\target\release"
@@ -56,6 +60,7 @@ VIAddVersionKey "LegalCopyright" "MIT License"
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
 !include "FileFunc.nsh"
+!include "Sections.nsh"
 
 !define MUI_ICON   "..\crates\sentineltask\assets\sentineltask.ico"
 !define MUI_UNICON "..\crates\sentineltask\assets\sentineltask.ico"
@@ -105,8 +110,26 @@ FunctionEnd
 !insertmacro EnsureNotRunning ""
 !insertmacro EnsureNotRunning "un."
 
-Function .onInit
-  Call EnsureNotRunning
+Var UpdateMode
+Var Relaunch
+
+; Update mode: SentinelTask has just been asked to close; give it up to a
+; minute (it finishes saving and releases held keys first).
+Function WaitUntilClosed
+  StrCpy $1 0
+  wait:
+    System::Call 'kernel32::OpenMutexW(i 0x00100000, i 0, w "SentinelTask.Running") p .r0'
+    ${If} $0 P<> 0
+      System::Call 'kernel32::CloseHandle(p r0)'
+      IntOp $1 $1 + 1
+      ${If} $1 > 240
+        Abort
+      ${EndIf}
+      Sleep 250
+      Goto wait
+    ${EndIf}
+  ; The program file is unlocked a moment after the process ends.
+  Sleep 500
 FunctionEnd
 
 Function un.onInit
@@ -165,6 +188,45 @@ Section /o "Open TinyTask .rec files with ${APP}" SecRec
   WriteRegStr HKCU "${REGKEY}" "AssocRec" "1"
   System::Call 'shell32::SHChangeNotify(i 0x08000000, i 0, p 0, p 0)'
 SectionEnd
+
+; .onInit comes after the sections so it can refer to their ids.
+Function .onInit
+  ${GetParameters} $R0
+  ClearErrors
+  ${GetOptions} $R0 "/UPDATE" $R1
+  ${IfNot} ${Errors}
+    StrCpy $UpdateMode 1
+  ${EndIf}
+  ClearErrors
+  ${GetOptions} $R0 "/RELAUNCH" $R1
+  ${IfNot} ${Errors}
+    StrCpy $Relaunch 1
+  ${EndIf}
+
+  ${If} $UpdateMode == 1
+    Call WaitUntilClosed
+    ; Keep what the user chose when they first installed.
+    ${IfNot} ${FileExists} "$DESKTOP\${APP}.lnk"
+      SectionSetFlags ${SecDesktop} 0
+    ${EndIf}
+    ReadRegStr $0 HKCU "${REGKEY}" "AssocStmacro"
+    ${If} $0 != "1"
+      SectionSetFlags ${SecAssoc} 0
+    ${EndIf}
+    ReadRegStr $0 HKCU "${REGKEY}" "AssocRec"
+    ${If} $0 == "1"
+      SectionSetFlags ${SecRec} ${SF_SELECTED}
+    ${EndIf}
+  ${Else}
+    Call EnsureNotRunning
+  ${EndIf}
+FunctionEnd
+
+Function .onInstSuccess
+  ${If} $Relaunch == 1
+    Exec '"$INSTDIR\${EXE}"'
+  ${EndIf}
+FunctionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
   !insertmacro MUI_DESCRIPTION_TEXT ${SecApp} "The ${APP} program and a Start menu shortcut."

@@ -55,6 +55,22 @@ impl SentinelApp {
             }
             ui.add_space(8.0);
         }
+        if let Some(v) = self.pending_install.as_ref().map(|p| p.version) {
+            if widgets::banner(
+                ui,
+                &p,
+                BannerKind::Info,
+                &format!("SentinelTask {v} is ready"),
+                "It installs automatically when you close SentinelTask — or restart now to update.",
+                &["Restart now"],
+            )
+            .is_some()
+            {
+                let ctx = ui.ctx().clone();
+                self.update_now(&ctx);
+            }
+            ui.add_space(8.0);
+        }
         let failed: Vec<String> = self
             .hotkey_status
             .iter()

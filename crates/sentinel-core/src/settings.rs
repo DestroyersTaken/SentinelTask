@@ -175,6 +175,31 @@ impl Default for UiSettings {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UpdateSettings {
+    /// Look for a new release on GitHub at start-up and every few hours.
+    pub check_automatically: bool,
+    /// Installed copies: download new versions in the background and
+    /// install them when SentinelTask closes (or on "Restart now").
+    pub install_automatically: bool,
+    /// A version the user chose to skip ("Skip this version").
+    pub skipped_version: String,
+    /// The version that last ran, to say "Updated to …" once.
+    pub last_run_version: String,
+}
+
+impl Default for UpdateSettings {
+    fn default() -> Self {
+        Self {
+            check_automatically: true,
+            install_automatically: true,
+            skipped_version: String::new(),
+            last_run_version: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -188,6 +213,7 @@ pub struct Settings {
     /// Folder holding the macro library; empty = default location.
     pub library_dir: String,
     pub recent_files: Vec<String>,
+    pub updates: UpdateSettings,
 }
 
 impl Settings {
@@ -232,6 +258,12 @@ mod tests {
         let partial = Settings::from_json("{\"ui\":{\"theme\":\"light\"}}");
         assert_eq!(partial.ui.theme, Theme::Light);
         assert_eq!(partial.hotkeys, Hotkeys::default());
+        // 1.0 settings files have no "updates" section: updates default on.
+        assert!(partial.updates.check_automatically && partial.updates.install_automatically);
+        assert!(partial.updates.last_run_version.is_empty());
+        let skip = Settings::from_json("{\"updates\":{\"skipped_version\":\"1.2.0\"}}");
+        assert_eq!(skip.updates.skipped_version, "1.2.0");
+        assert!(skip.updates.check_automatically);
         // Garbage falls back to defaults.
         assert_eq!(Settings::from_json("{{{"), Settings::default());
     }

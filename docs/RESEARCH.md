@@ -90,6 +90,25 @@ window manager, GitHub's Windows runners) rather than unit tests alone:
 | Rebinding a hotkey could get stuck on "press keys" | The system hook path had no fallback and no way out | Cancel button, Esc, and a fallback that reads keys from SentinelTask's own window |
 | Fast double-press of a hotkey counted once | The duplicate guard merged genuine presses | Only the *same* press arriving via both detection paths is merged |
 
+### Updates
+
+- Downloads use WinHTTP, so the Windows proxy settings and certificate store
+  apply (as in the browser) and nothing extra ships in the exe. A file
+  downloaded this way has no "downloaded from the internet" mark, so
+  SmartScreen doesn't block the update.
+- Windows can't overwrite a running exe, but it can rename one. A portable
+  update writes `SentinelTask.exe.new`, renames the running exe to `.old`,
+  moves the new one into place (and moves the old one back if that fails),
+  and starts it. The new copy waits for the old process to exit, because the
+  old one still holds the global hotkeys, then deletes `.old`.
+- The installer's update mode (`/S /UPDATE`) waits on the `SentinelTask.Running`
+  mutex instead of showing a "please close" box, and it re-selects only the
+  optional parts that were installed before. Otherwise a silent install
+  would bring back a desktop shortcut the user had deleted.
+- GitHub publishes a SHA-256 `digest` for every release file. The updater
+  checks it, the size, and that the file is a Windows program before
+  replacing anything.
+
 ## 5. Responsible use
 
 SentinelTask automates *your own* mouse and keyboard. Many online games

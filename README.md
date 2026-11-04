@@ -51,6 +51,9 @@ full write-up is in [`docs/RESEARCH.md`](docs/RESEARCH.md).
 - **Import TinyTask `.rec` files**
 - **Export a standalone `.exe`** player for a macro (TinyTask's "Compile EXE")
 - **Command line** for scripts and Windows Task Scheduler
+- **Automatic updates**: the installed version updates itself in the
+  background when you close it; the portable version asks before replacing
+  its `SentinelTask.exe`
 - **Portable mode**, dark & light themes, UI zoom
 - Optional safety stops: stop when you touch the mouse or keyboard
 - Readable, versioned JSON macro files (`.stmacro`)
@@ -90,6 +93,26 @@ full write-up is in [`docs/RESEARCH.md`](docs/RESEARCH.md).
 - **Portable:** create an empty file named `portable` next to
   `SentinelTask.exe` to keep settings and macros beside it (e.g. on a USB stick).
 
+## Updates
+
+SentinelTask checks this repository's
+[latest release](https://github.com/DestroyersTaken/SentinelTask/releases/latest)
+when it starts and every few hours (turn this off in *Settings → Updates*).
+
+- **Installed:** the new installer is downloaded in the background and runs
+  silently when you close SentinelTask. Or click *Restart now* to update
+  straight away. A running macro is never interrupted, and your shortcuts,
+  file associations, settings and macros are kept.
+- **Portable:** you're asked first: *Replace and restart*, *Not now* or
+  *Skip this version*. The new `SentinelTask.exe` replaces the old one in
+  the same folder, so settings and macros there stay put.
+
+Every download is checked against the SHA-256 checksum GitHub publishes for
+the release file before anything is replaced. A release needs a
+`…-portable.zip` and a `…-setup.exe` or `…-installer.zip` named like the
+ones `packaging/make-dist.sh` builds, and its tag must be a higher version
+number (for example `1.1.0` or `v1.1.0`).
+
 ## Command line
 
 ```text
@@ -100,6 +123,8 @@ SentinelTask.exe play macro.stmacro --for 2h --delay 500
 SentinelTask.exe record out.stmacro --seconds 30
 SentinelTask.exe info macro.stmacro
 SentinelTask.exe convert old.rec new.stmacro
+SentinelTask.exe update                  update to the newest release
+SentinelTask.exe update --check          just say whether one exists
 ```
 
 Headless playback honours the emergency-stop hotkey and `Ctrl+C`, and always

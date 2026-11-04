@@ -86,6 +86,7 @@ pub enum Modal {
     UnsavedOnClose,
     UnsavedBeforeOpen(OpenTarget),
     Message { title: String, text: String },
+    UpdateAvailable(crate::update::Release),
 }
 
 type ModalAction = Box<dyn FnOnce(&mut SentinelApp, &egui::Context)>;
@@ -93,6 +94,8 @@ type ModalAction = Box<dyn FnOnce(&mut SentinelApp, &egui::Context)>;
 pub enum OpenTarget {
     File(PathBuf),
     NewRecording,
+    /// Apply a downloaded update (SentinelTask restarts).
+    Update(crate::update::Prepared),
 }
 
 /// Window size of the compact (TinyTask-style) toolbar, in points.
@@ -222,6 +225,13 @@ pub struct SentinelApp {
     size_target: Option<egui::Vec2>,
     /// Clicks made by the last auto-clicker run.
     pub last_clicker_count: Option<u64>,
+    pub updater: crate::update::Updater,
+    /// A newer version to offer (shown when SentinelTask is idle).
+    pub update_offer: Option<crate::update::Release>,
+    /// Installed copies: a downloaded installer to run when SentinelTask closes.
+    pub pending_install: Option<crate::update::Prepared>,
+    /// An update the user asked to apply, waiting for the current run to end.
+    apply_when_idle: Option<crate::update::Prepared>,
 }
 
 fn waker_for(ctx: &egui::Context) -> platform::Waker {
@@ -249,6 +259,17 @@ impl SentinelApp {
         library.refresh();
         let palette = theme::palette(settings.ui.theme);
         let player_mode = launch.embedded.is_some();
+        let exe = std::env::current_exe().unwrap_or_default();
+        let install_kind = crate::update::InstallKind::detect(&exe, paths.portable);
+        // No update checks from exported players, or during self-tests
+        // unless they point the updater at a test feed.
+        let updates_enabled = !player_mode
+            && std::env::var_os("SENTINEL_NO_UPDATE").is_none()
+            && (std::env::var_os("SENTINEL_SELFTEST").is_none() || std::env::var_os("SENTINEL_UPDATE_API").is_some());
+        if updates_enabled {
+            crate::update::cleanup_after_update(&exe);
+        }
+        let updater = crate::update::Updater::new(exe, install_kind, updates_enabled, waker_for(&cc.egui_ctx));
         let mut app = Self {
             settings,
             paths,
@@ -290,7 +311,21 @@ impl SentinelApp {
             size_retry_at: Instant::now(),
             size_target: None,
             last_clicker_count: None,
+            updater,
+            update_offer: None,
+            pending_install: None,
+            apply_when_idle: None,
         };
+        if !player_mode && app.settings.updates.last_run_version != sentinel_core::APP_VERSION {
+            if !app.settings.updates.last_run_version.is_empty() {
+                app.toast(
+                    ToastKind::Ok,
+                    format!("Updated to SentinelTask {}.", sentinel_core::APP_VERSION),
+                );
+            }
+            app.settings.updates.last_run_version = sentinel_core::APP_VERSION.into();
+            app.mark_settings_dirty();
+        }
         // Start on a specific page (used for documentation screenshots).
         if let Ok(page) = std::env::var("SENTINEL_PAGE") {
             app.page = match page.to_ascii_lowercase().as_str() {
@@ -1117,6 +1152,119 @@ impl SentinelApp {
         if self.settings_dirty {
             self.save_settings_now();
         }
+        // Installed copies: a downloaded update installs as SentinelTask
+        // closes (the installer waits for this process to exit).
+        if let Some(p) = self.pending_install.take() {
+            if self.settings.updates.install_automatically {
+                if let Err(e) = crate::update::apply(&p, &self.updater.exe, false) {
+                    log_warn!("installing update on exit failed: {e}");
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Updates
+    // -----------------------------------------------------------------
+
+    fn drive_updates(&mut self, ctx: &egui::Context) {
+        use crate::update::{InstallKind, UpdateEvent};
+        let u = &self.settings.updates;
+        let (auto_check, auto_install) = (u.check_automatically, u.install_automatically);
+        self.updater.tick(auto_check, auto_install);
+        while let Ok(ev) = self.updater.rx.try_recv() {
+            match ev {
+                UpdateEvent::UpToDate { manual } => {
+                    if manual {
+                        self.toast(
+                            ToastKind::Ok,
+                            format!("You have the latest version ({}).", sentinel_core::APP_VERSION),
+                        );
+                    }
+                }
+                UpdateEvent::Available { release, manual } => {
+                    if !manual && release.version.to_string() == self.settings.updates.skipped_version {
+                        log_info!("update {} skipped by the user", release.version);
+                        continue;
+                    }
+                    self.update_offer = Some(release);
+                }
+                UpdateEvent::Ready { prepared, apply } => {
+                    if apply {
+                        self.apply_when_idle = Some(prepared);
+                    } else if prepared.kind == InstallKind::Installed {
+                        self.toast(
+                            ToastKind::Info,
+                            format!(
+                                "SentinelTask {} is downloaded — it installs when you close SentinelTask.",
+                                prepared.version
+                            ),
+                        );
+                        self.pending_install = Some(prepared);
+                    }
+                }
+                UpdateEvent::Failed { msg, manual } => {
+                    if manual {
+                        self.toast(ToastKind::Error, format!("Update failed: {msg}"));
+                    }
+                }
+            }
+        }
+        // Never interrupt a recording, a run or the auto-clicker.
+        let quiet = self.mode.is_idle() && self.capturing_hotkey.is_none() && !self.picking_point;
+        if quiet && self.modal.is_none() {
+            if let Some(p) = self.apply_when_idle.take() {
+                self.apply_update(ctx, p);
+            } else if !self.settings.ui.compact {
+                if let Some(r) = self.update_offer.take() {
+                    self.modal = Some(Modal::UpdateAvailable(r));
+                }
+            }
+        }
+    }
+
+    /// Install / swap in a downloaded update and restart SentinelTask.
+    pub fn apply_update(&mut self, ctx: &egui::Context, p: crate::update::Prepared) {
+        if self.has_unsaved_changes() {
+            self.modal = Some(Modal::UnsavedBeforeOpen(OpenTarget::Update(p)));
+            return;
+        }
+        match crate::update::apply(&p, &self.updater.exe, true) {
+            Ok(()) => {
+                self.pending_install = None;
+                self.allow_close = true;
+                self.shutdown();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            Err(e) => {
+                self.modal = Some(Modal::Message {
+                    title: "Couldn't update".into(),
+                    text: format!(
+                        "{e}.\n\nNothing was changed. You can download SentinelTask {} from the \
+                         releases page instead (About → Release page).",
+                        p.version
+                    ),
+                });
+            }
+        }
+    }
+
+    /// "Update now" / "Restart now": apply what's downloaded, or download
+    /// and then apply.
+    pub fn update_now(&mut self, ctx: &egui::Context) {
+        use crate::update::Phase;
+        if let Some(p) = self.pending_install.take() {
+            self.apply_update(ctx, p);
+            return;
+        }
+        match self.updater.phase() {
+            Phase::Ready(p) => self.apply_update(ctx, p),
+            Phase::Available(r) => {
+                self.toast(ToastKind::Info, format!("Downloading SentinelTask {}…", r.version));
+                self.updater.download(r, true);
+            }
+            _ => self.updater.check(true, self.settings.updates.install_automatically),
+        }
     }
 }
 
@@ -1140,6 +1288,7 @@ impl eframe::App for SentinelApp {
             }
         }
         self.drain_capture();
+        self.drive_updates(ctx);
         self.update_activity_watch();
         self.finish_playback_if_done(ctx);
         self.finish_clicker_if_done();
@@ -1509,6 +1658,13 @@ impl SentinelApp {
                     (Mode::Idle, None) => format!("Press {} to record", self.hotkey_text(HotkeyAction::Record)),
                     _ => self.mode_summary(),
                 };
+                let line = match (&self.mode, &self.update_offer) {
+                    (Mode::Idle, Some(r)) => format!(
+                        "SentinelTask {} is available · open the full window to update",
+                        r.version
+                    ),
+                    _ => line,
+                };
                 ui.label(RichText::new(line).size(11.5).color(p.text_faint));
             });
     }
@@ -1683,6 +1839,82 @@ impl SentinelApp {
                         }
                     });
                 }
+                Modal::UpdateAvailable(r) => {
+                    let portable = self.updater.kind == crate::update::InstallKind::Portable;
+                    ui.label(
+                        RichText::new(if portable {
+                            "New portable version available"
+                        } else {
+                            "Update available"
+                        })
+                        .size(17.0)
+                        .strong(),
+                    );
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "SentinelTask {} is out — you have {}.",
+                            r.version,
+                            crate::update::current_version()
+                        ))
+                        .color(p.text),
+                    );
+                    ui.add_space(2.0);
+                    ui.label(
+                        RichText::new(if portable {
+                            "Replace this copy's SentinelTask.exe with the new one? Your settings and \
+                             macros in this folder are kept. SentinelTask restarts when it's done."
+                        } else {
+                            "Install it now? SentinelTask closes, updates and opens again. Your settings \
+                             and macros are kept."
+                        })
+                        .color(p.text_dim),
+                    );
+                    ui.add_space(6.0);
+                    let notes = r.notes.trim();
+                    ui.horizontal(|ui| {
+                        if ui.link("Release page").clicked() {
+                            platform::open_url(&r.page_url);
+                        }
+                    });
+                    if !notes.is_empty() {
+                        egui::CollapsingHeader::new("What's new").show(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height(170.0).show(ui, |ui| {
+                                let text: String = notes.chars().take(4000).collect();
+                                ui.label(RichText::new(text).size(12.5).color(p.text_dim));
+                            });
+                        });
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let go = if portable {
+                                "Replace and restart"
+                            } else {
+                                "Update and restart"
+                            };
+                            if widgets::primary_button(ui, &p, go).clicked() {
+                                let r = r.clone();
+                                action = Some(Box::new(move |app, _| {
+                                    app.toast(ToastKind::Info, format!("Downloading SentinelTask {}…", r.version));
+                                    app.updater.download(r, true);
+                                }));
+                                keep = false;
+                            }
+                            if ui.button("Not now").clicked() {
+                                keep = false;
+                            }
+                            if ui.button("Skip this version").clicked() {
+                                let v = r.version.to_string();
+                                action = Some(Box::new(move |app, _| {
+                                    app.settings.updates.skipped_version = v;
+                                    app.mark_settings_dirty();
+                                }));
+                                keep = false;
+                            }
+                        });
+                    });
+                }
                 Modal::ConfirmDelete(path, name) => {
                     ui.label(RichText::new("Delete macro?").size(17.0).strong());
                     ui.add_space(6.0);
@@ -1759,6 +1991,7 @@ impl SentinelApp {
                                     Modal::UnsavedBeforeOpen(OpenTarget::NewRecording) => {
                                         app.start_recording(ctx, false)
                                     }
+                                    Modal::UnsavedBeforeOpen(OpenTarget::Update(p)) => app.apply_update(ctx, p),
                                     _ => {}
                                 }
                             }));

@@ -40,6 +40,83 @@ jobs:
           if ($p.ExitCode -ne 0) { Write-Error "exit code $($p.ExitCode)"; exit 1 }
           $p = Start-Process -FilePath target/release/SentinelTask.exe -ArgumentList 'info','does-not-exist.stmacro' -Wait -PassThru -NoNewWindow
           if ($p.ExitCode -ne 1) { Write-Error "expected exit code 1 for a missing file, got $($p.ExitCode)"; exit 1 }
+      - name: "Updater: live GitHub download, then a portable update from a local feed"
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path target/release/SentinelTask.exe).Path
+          function Invoke-ST($file, [string[]]$arguments, $dir) {
+            $p = Start-Process -FilePath $file -ArgumentList $arguments -Wait -PassThru -NoNewWindow `
+              -RedirectStandardOutput "$dir\out.txt" -RedirectStandardError "$dir\err.txt"
+            Get-Content "$dir\out.txt", "$dir\err.txt" | ForEach-Object { Write-Host $_ }
+            return $p.ExitCode
+          }
+          function New-Portable($name) {
+            $d = Join-Path $env:RUNNER_TEMP $name
+            New-Item -ItemType Directory -Force $d | Out-Null
+            Copy-Item $exe "$d\SentinelTask.exe"
+            New-Item -ItemType File -Force "$d\portable.txt" | Out-Null
+            return $d
+          }
+
+          # 1. Real GitHub: HTTPS through WinHTTP, redirects to the CDN, digest check, unzip.
+          $d = New-Portable 'upd-live'
+          $env:SENTINEL_VERSION_OVERRIDE = '0.0.1'
+          $done = $false; $skipped = $false
+          for ($i = 0; $i -lt 3 -and -not $done; $i++) {
+            $code = Invoke-ST "$d\SentinelTask.exe" @('update', '--download-only') $d
+            if ($code -eq 0) { $done = $true }
+            elseif (Select-String -Path "$d\err.txt" -Pattern 'HTTP 403|HTTP 429' -Quiet) {
+              Write-Warning 'GitHub API rate limit on this runner; skipping the live download'; $done = $true; $skipped = $true
+            } else { Start-Sleep -Seconds 10 }
+          }
+          if (-not $done) { Write-Error 'live update download failed'; exit 1 }
+          if (-not $skipped) {
+            $new = Get-Item "$d\SentinelTask.exe.new"
+            $head = [System.IO.File]::ReadAllBytes($new.FullName)[0..1]
+            if ($new.Length -lt 1MB -or $head[0] -ne 0x4D -or $head[1] -ne 0x5A) { Write-Error 'downloaded exe is not valid'; exit 1 }
+            Write-Output "live download OK: $($new.Length) bytes"
+          }
+          Remove-Item Env:SENTINEL_VERSION_OVERRIDE
+          $code = Invoke-ST $exe @('update', '--check') $d
+          if ($code -ne 0 -and -not (Select-String -Path "$d\err.txt" -Pattern 'HTTP 403|HTTP 429' -Quiet)) { Write-Error "update --check failed ($code)"; exit 1 }
+
+          # 2. Local feed: a "9.9.9" release whose exe is ours plus a marker.
+          $feed = Join-Path $env:RUNNER_TEMP 'upd-feed'
+          New-Item -ItemType Directory -Force "$feed\stage\SentinelTask" | Out-Null
+          Copy-Item $exe "$feed\stage\SentinelTask\SentinelTask.exe"
+          $marker = [System.Text.Encoding]::ASCII.GetBytes('UPDATED-BY-CI-MARKER')
+          $f = [System.IO.File]::Open("$feed\stage\SentinelTask\SentinelTask.exe", 'Append'); $f.Write($marker, 0, $marker.Length); $f.Close()
+          Compress-Archive -Path "$feed\stage\SentinelTask" -DestinationPath "$feed\SentinelTask-9.9.9-portable.zip" -Force
+          $zip = Get-Item "$feed\SentinelTask-9.9.9-portable.zip"
+          function Write-Feed($hash) {
+            @{ tag_name = 'v9.9.9'; draft = $false; prerelease = $false; assets = @(@{
+              name = $zip.Name; size = $zip.Length; state = 'uploaded'
+              browser_download_url = 'file://' + $zip.FullName.Replace('\', '/'); digest = "sha256:$hash" }) } |
+              ConvertTo-Json -Depth 5 | Set-Content "$feed\release.json"
+          }
+          $env:SENTINEL_UPDATE_API = 'file://' + "$feed\release.json".Replace('\', '/')
+          $env:SENTINEL_VERSION_OVERRIDE = '1.0.0'
+
+          # A damaged download must change nothing.
+          Write-Feed ('0' * 64)
+          $d = New-Portable 'upd-bad'
+          $code = Invoke-ST "$d\SentinelTask.exe" @('update') $d
+          if ($code -eq 0) { Write-Error 'a bad checksum was accepted'; exit 1 }
+          if ((Get-FileHash "$d\SentinelTask.exe").Hash -ne (Get-FileHash $exe).Hash -or (Test-Path "$d\SentinelTask.exe.new")) { Write-Error 'exe changed after a bad download'; exit 1 }
+
+          # A good one replaces the exe, and the new exe runs.
+          Write-Feed ((Get-FileHash $zip.FullName -Algorithm SHA256).Hash.ToLower())
+          $d = New-Portable 'upd-good'
+          $code = Invoke-ST "$d\SentinelTask.exe" @('update') $d
+          if ($code -ne 0) { Write-Error "portable update failed ($code)"; exit 1 }
+          $bytes = [System.IO.File]::ReadAllBytes("$d\SentinelTask.exe")
+          $tail = [System.Text.Encoding]::ASCII.GetString($bytes, $bytes.Length - $marker.Length, $marker.Length)
+          if ($tail -ne 'UPDATED-BY-CI-MARKER') { Write-Error 'exe was not replaced'; exit 1 }
+          if (-not (Test-Path "$d\SentinelTask.exe.old")) { Write-Error 'old exe missing'; exit 1 }
+          Remove-Item Env:SENTINEL_UPDATE_API, Env:SENTINEL_VERSION_OVERRIDE
+          $code = Invoke-ST "$d\SentinelTask.exe" @('--version') $d
+          if ($code -ne 0) { Write-Error 'the updated exe does not run'; exit 1 }
+          Write-Output 'portable update OK'
       - name: "GUI self-test (16 real-input scenarios: hotkeys, minimized, pause, rebind, clicker, compact, files, memory)"
         shell: pwsh
         run: |

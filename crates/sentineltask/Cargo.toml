@@ -20,6 +20,9 @@ egui_extras = { version = "0.37", default-features = false }
 crossbeam-channel = "0.5"
 parking_lot = "0.12"
 dirs = "6"
+sha2 = "0.10"
+crc32fast = "1"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [target.'cfg(windows)'.dependencies]
 rfd = "0.17"
@@ -27,6 +30,7 @@ windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
   "Win32_Media",
+  "Win32_Networking_WinHttp",
   "Win32_Security",
   "Win32_System_LibraryLoader",
   "Win32_System_Power",

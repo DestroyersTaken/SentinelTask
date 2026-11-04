@@ -93,6 +93,19 @@ pub fn restart_as_admin(_args: &[String]) -> Result<(), String> {
     Err("Only available on Windows".into())
 }
 
+pub fn http_get(
+    _url: &str,
+    _accept: &str,
+    _max_bytes: u64,
+    _progress: &mut dyn FnMut(u64, Option<u64>) -> bool,
+) -> Result<Vec<u8>, String> {
+    Err("downloading is only available on Windows".into())
+}
+
+pub fn wait_for_process_exit(_pid: u32, _timeout: Duration) {}
+
+pub fn open_url(_url: &str) {}
+
 pub fn keep_awake(_on: bool) {}
 
 pub fn wait_modifiers_released(_timeout: Duration) -> bool {

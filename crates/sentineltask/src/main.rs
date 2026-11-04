@@ -13,6 +13,7 @@ mod paths;
 mod payload;
 mod platform;
 mod ui;
+mod update;
 
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -163,6 +164,15 @@ fn run_gui(launch: ui::app::LaunchOptions) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // Started by an update: let the previous copy finish exiting first (it
+    // still holds the hotkeys and the files being replaced).
+    if let Some(pid) = std::env::var(update::AFTER_UPDATE_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        std::env::remove_var(update::AFTER_UPDATE_ENV);
+        platform::wait_for_process_exit(pid, std::time::Duration::from_secs(20));
+    }
     platform::init_process();
     let paths = paths::Paths::detect();
     logging::init(&paths.log_dir);
@@ -201,6 +211,10 @@ fn main() -> ExitCode {
         cli::Command::Info(p) => {
             platform::attach_parent_console();
             cli::info(&p)
+        }
+        cli::Command::Update(mode) => {
+            platform::attach_parent_console();
+            cli::update(mode, embedded.is_some())
         }
         cli::Command::Convert(a, b) => {
             platform::attach_parent_console();

@@ -775,6 +775,9 @@ impl SentinelApp {
         });
         ui.add_space(12.0);
 
+        self.updates_card(ui, &mut changed);
+        ui.add_space(12.0);
+
         let mut pick_dir = false;
         let mut reset_dir = false;
         widgets::card(ui, &p, |ui| {
@@ -823,6 +826,113 @@ impl SentinelApp {
         }
     }
 
+    fn updates_card(&mut self, ui: &mut egui::Ui, changed: &mut bool) {
+        use crate::update::{InstallKind, Phase};
+        let p = self.palette;
+        let ctx = ui.ctx().clone();
+        widgets::card(ui, &p, |ui| {
+            let portable = self.updater.kind == InstallKind::Portable;
+            widgets::card_title(
+                ui,
+                &p,
+                "Updates",
+                Some(if portable {
+                    "Portable copy — you're asked before SentinelTask.exe is replaced."
+                } else {
+                    "New versions come from SentinelTask's GitHub releases page."
+                }),
+            );
+            if !self.updater.enabled {
+                ui.label(
+                    RichText::new(if self.player_mode {
+                        "Standalone players don't update themselves."
+                    } else {
+                        "Updates are turned off for this session."
+                    })
+                    .color(p.text_dim),
+                );
+                return;
+            }
+            let u = &mut self.settings.updates;
+            *changed |= widgets::toggle_row(
+                ui,
+                &p,
+                &mut u.check_automatically,
+                "Check for updates automatically",
+                "When SentinelTask starts and every few hours. Only the version is fetched from GitHub; nothing \
+                 about you is sent.",
+            );
+            if !portable {
+                *changed |= widgets::toggle_row(
+                    ui,
+                    &p,
+                    &mut u.install_automatically,
+                    "Install updates automatically",
+                    "Downloads new versions in the background and installs them when you close SentinelTask. \
+                     A running macro is never interrupted.",
+                );
+            }
+            if !u.skipped_version.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Skipping version {}", u.skipped_version)).color(p.text_dim));
+                    if ui.small_button("Don't skip").clicked() {
+                        u.skipped_version.clear();
+                        *changed = true;
+                    }
+                });
+            }
+            ui.add_space(4.0);
+            let phase = self.updater.phase();
+            let pending = self.pending_install.as_ref().map(|p| p.version);
+            ui.horizontal(|ui| {
+                let working = self.updater.is_working();
+                match (&phase, pending) {
+                    (_, Some(_)) | (Phase::Ready(_), _) => {
+                        if widgets::primary_button(ui, &p, "Restart and update").clicked() {
+                            self.update_now(&ctx);
+                        }
+                    }
+                    (Phase::Available(_), _) => {
+                        let label = if portable {
+                            "Replace and restart"
+                        } else {
+                            "Update and restart"
+                        };
+                        if widgets::primary_button(ui, &p, label).clicked() {
+                            self.update_now(&ctx);
+                        }
+                    }
+                    (Phase::Downloading { .. }, _) => {
+                        if ui.button("Cancel").clicked() {
+                            self.updater.cancel();
+                        }
+                    }
+                    _ => {
+                        if ui.add_enabled(!working, egui::Button::new("Check now")).clicked() {
+                            self.updater.check(true, self.settings.updates.install_automatically);
+                        }
+                    }
+                }
+                let status = match pending {
+                    Some(v) => format!("Version {v} is ready — it installs when SentinelTask closes"),
+                    None => crate::update::describe(&phase),
+                };
+                ui.label(RichText::new(status).color(p.text_dim));
+                if let Phase::Downloading {
+                    done, total: Some(t), ..
+                } = phase
+                {
+                    if t > 0 {
+                        ui.add(egui::ProgressBar::new(done as f32 / t as f32).desired_width(120.0));
+                    }
+                    ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                } else if working {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(200));
+                }
+            });
+        });
+    }
+
     // -----------------------------------------------------------------
     // About
     // -----------------------------------------------------------------
@@ -847,6 +957,15 @@ impl SentinelApp {
                         ))
                         .color(p.text_dim),
                     );
+                    ui.horizontal(|ui| {
+                        if ui.link("Release page").clicked() {
+                            platform::open_url(crate::update::RELEASES_PAGE);
+                        }
+                        if self.updater.enabled && ui.link("Check for updates").clicked() {
+                            self.page = Page::Settings;
+                            self.updater.check(true, self.settings.updates.install_automatically);
+                        }
+                    });
                 });
             });
             ui.add_space(8.0);

@@ -330,6 +330,18 @@ pub fn own_pid() -> u32 {
     unsafe { GetCurrentProcessId() }
 }
 
+/// Open a web page in the default browser.
+pub fn open_url(url: &str) {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return;
+    }
+    let verb = wide("open");
+    let u = wide(url);
+    unsafe {
+        ShellExecuteW(null_mut(), verb.as_ptr(), u.as_ptr(), null(), null(), SW_SHOWNORMAL);
+    }
+}
+
 /// Relaunch elevated ("Run as administrator"). Returns `Ok` if the new
 /// process was started; the caller should then exit.
 pub fn restart_as_admin(args: &[String]) -> Result<(), String> {
@@ -356,6 +368,191 @@ pub fn restart_as_admin(args: &[String]) -> Result<(), String> {
         Ok(())
     } else {
         Err("Windows did not start the elevated copy (the UAC prompt may have been cancelled).".into())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HTTPS downloads (updates)
+// ---------------------------------------------------------------------------
+
+/// Owned WinHTTP handle, closed on drop.
+struct HInternet(*mut c_void);
+
+impl Drop for HInternet {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { windows_sys::Win32::Networking::WinHttp::WinHttpCloseHandle(self.0) };
+        }
+    }
+}
+
+fn winhttp_error(what: &str) -> String {
+    let code = unsafe { GetLastError() };
+    let hint = match code {
+        12002 => " (timed out)",
+        12007 => " (server name not found — are you online?)",
+        12029 | 12030 => " (could not connect)",
+        12175 | 12045 | 12169 => " (secure connection failed)",
+        _ => "",
+    };
+    format!("{what} failed: error {code}{hint}")
+}
+
+/// GET a URL with WinHTTP. Uses the Windows proxy settings and certificate
+/// store (so it behaves like the browser does) and follows redirects.
+/// `progress(received, total)` is called as data arrives; returning `false`
+/// cancels the download.
+pub fn http_get(
+    url: &str,
+    accept: &str,
+    max_bytes: u64,
+    progress: &mut dyn FnMut(u64, Option<u64>) -> bool,
+) -> Result<Vec<u8>, String> {
+    use windows_sys::Win32::Networking::WinHttp::*;
+    let u = crate::update::HttpUrl::parse(url)?;
+    let agent = wide(&format!(
+        "SentinelTask/{} (Windows; updater)",
+        sentinel_core::APP_VERSION
+    ));
+    unsafe {
+        // Automatic proxy (Windows 8.1+), falling back to the classic
+        // default-proxy mode on older systems.
+        let mut session = HInternet(WinHttpOpen(
+            agent.as_ptr(),
+            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+            null(),
+            null(),
+            0,
+        ));
+        if session.0.is_null() {
+            session = HInternet(WinHttpOpen(
+                agent.as_ptr(),
+                WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                null(),
+                null(),
+                0,
+            ));
+        }
+        if session.0.is_null() {
+            return Err(winhttp_error("Starting the download"));
+        }
+        // resolve, connect, send, receive (ms)
+        WinHttpSetTimeouts(session.0, 15_000, 15_000, 30_000, 30_000);
+        let protocols: u32 = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2 | WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
+        if WinHttpSetOption(
+            session.0,
+            WINHTTP_OPTION_SECURE_PROTOCOLS,
+            &protocols as *const u32 as *const c_void,
+            4,
+        ) == 0
+        {
+            // TLS 1.3 isn't known to older WinHTTP builds; TLS 1.2 is enough.
+            let tls12: u32 = WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;
+            WinHttpSetOption(
+                session.0,
+                WINHTTP_OPTION_SECURE_PROTOCOLS,
+                &tls12 as *const u32 as *const c_void,
+                4,
+            );
+        }
+        let host = wide(&u.host);
+        let conn = HInternet(WinHttpConnect(session.0, host.as_ptr(), u.port, 0));
+        if conn.0.is_null() {
+            return Err(winhttp_error("Connecting"));
+        }
+        let verb = wide("GET");
+        let path = wide(&u.path);
+        let req = HInternet(WinHttpOpenRequest(
+            conn.0,
+            verb.as_ptr(),
+            path.as_ptr(),
+            null(),
+            null(),
+            null(),
+            if u.secure { WINHTTP_FLAG_SECURE } else { 0 },
+        ));
+        if req.0.is_null() {
+            return Err(winhttp_error("Opening the request"));
+        }
+        let headers = wide(&format!("Accept: {accept}\r\n"));
+        if WinHttpSendRequest(req.0, headers.as_ptr(), u32::MAX, null(), 0, 0, 0) == 0 {
+            return Err(winhttp_error("Sending the request"));
+        }
+        if WinHttpReceiveResponse(req.0, null_mut()) == 0 {
+            return Err(winhttp_error("Receiving the response"));
+        }
+        let mut status: u32 = 0;
+        let mut len = 4u32;
+        WinHttpQueryHeaders(
+            req.0,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            null(),
+            &mut status as *mut u32 as *mut c_void,
+            &mut len,
+            null_mut(),
+        );
+        if status != 200 {
+            return Err(match status {
+                403 | 429 => format!("the server is busy (HTTP {status}); try again later"),
+                404 => "not found (HTTP 404)".to_string(),
+                _ => format!("the server answered HTTP {status}"),
+            });
+        }
+        let mut total: u64 = 0;
+        let mut len = 8u32;
+        let total = if WinHttpQueryHeaders(
+            req.0,
+            WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER64,
+            null(),
+            &mut total as *mut u64 as *mut c_void,
+            &mut len,
+            null_mut(),
+        ) != 0
+        {
+            Some(total)
+        } else {
+            None
+        };
+        if total.is_some_and(|t| t > max_bytes) {
+            return Err("the download is unexpectedly large".into());
+        }
+        let mut body: Vec<u8> = Vec::with_capacity(total.unwrap_or(64 * 1024).min(max_bytes) as usize);
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            let mut read = 0u32;
+            if WinHttpReadData(req.0, chunk.as_mut_ptr() as *mut c_void, chunk.len() as u32, &mut read) == 0 {
+                return Err(winhttp_error("Downloading"));
+            }
+            if read == 0 {
+                break;
+            }
+            body.extend_from_slice(&chunk[..read as usize]);
+            if body.len() as u64 > max_bytes {
+                return Err("the download is unexpectedly large".into());
+            }
+            if !progress(body.len() as u64, total) {
+                return Err("cancelled".into());
+            }
+        }
+        if let Some(t) = total {
+            if body.len() as u64 != t {
+                return Err(format!("the download was cut off ({} of {t} bytes)", body.len()));
+            }
+        }
+        Ok(body)
+    }
+}
+
+/// Wait (up to `timeout`) for a process to exit — used after an update so
+/// the new copy doesn't start while the old one still holds the hotkeys.
+pub fn wait_for_process_exit(pid: u32, timeout: Duration) {
+    use windows_sys::Win32::System::Threading::PROCESS_SYNCHRONIZE;
+    unsafe {
+        let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if !h.is_null() {
+            WaitForSingleObject(h, timeout.as_millis().min(u32::MAX as u128 - 1) as u32);
+            CloseHandle(h);
+        }
     }
 }
 

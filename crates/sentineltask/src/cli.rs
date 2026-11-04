@@ -24,6 +24,10 @@ USAGE
   SentinelTask.exe info <file>          show details about a macro
   SentinelTask.exe convert <in.rec> <out.stmacro>
                                         convert a TinyTask recording
+  SentinelTask.exe update [--check | --download-only]
+                                        update to the newest release (installed:
+                                        runs the installer silently; portable:
+                                        replaces SentinelTask.exe)
 
 PLAY OPTIONS
   --loops <n>         play n times
@@ -49,6 +53,15 @@ pub struct PlayArgs {
     pub countdown: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateMode {
+    /// Only say whether a newer version exists.
+    Check,
+    /// Download and stage it, but don't install.
+    DownloadOnly,
+    Apply,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Gui { file: Option<PathBuf> },
@@ -56,6 +69,7 @@ pub enum Command {
     Record { out: PathBuf, seconds: Option<u64> },
     Info(PathBuf),
     Convert(PathBuf, PathBuf),
+    Update(UpdateMode),
     Help,
     Version,
 }
@@ -101,6 +115,12 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
                 seconds,
             })
         }
+        "update" => match args.get(1).map(String::as_str) {
+            None => Ok(Command::Update(UpdateMode::Apply)),
+            Some("--check") => Ok(Command::Update(UpdateMode::Check)),
+            Some("--download-only") => Ok(Command::Update(UpdateMode::DownloadOnly)),
+            Some(o) => Err(format!("update: unexpected {o}")),
+        },
         "convert" => match (args.get(1), args.get(2)) {
             (Some(a), Some(b)) => Ok(Command::Convert(PathBuf::from(a), PathBuf::from(b))),
             _ => Err("convert: usage: convert <in.rec> <out.stmacro>".into()),
@@ -154,6 +174,74 @@ pub fn parse(args: &[String]) -> Result<Command, String> {
             file: Some(PathBuf::from(f)),
         }),
         other => Err(format!("unknown option {other} (try --help)")),
+    }
+}
+
+pub fn update(mode: UpdateMode, is_player: bool) -> i32 {
+    use crate::update::{self, InstallKind};
+    if is_player {
+        eprintln!("This is a standalone macro player; it doesn't update itself.");
+        return 1;
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        eprintln!("error: can't find SentinelTask.exe");
+        return 1;
+    };
+    let kind = InstallKind::detect(&exe, crate::paths::Paths::detect().portable);
+    let current = update::current_version();
+    let release = match update::check_latest() {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            println!("SentinelTask {current} is up to date.");
+            return 0;
+        }
+        Err(e) => {
+            eprintln!("error: couldn't check for updates: {e}");
+            return 1;
+        }
+    };
+    println!("SentinelTask {} is available (you have {current}).", release.version);
+    if mode == UpdateMode::Check {
+        return 0;
+    }
+    let mut last = 0u64;
+    let prepared = match update::download_and_prepare(&release, kind, &exe, &mut |done, total| {
+        if done - last >= 1024 * 1024 || Some(done) == total {
+            last = done;
+            match total {
+                Some(t) => eprintln!("  {:.1} / {:.1} MB", done as f64 / 1_048_576.0, t as f64 / 1_048_576.0),
+                None => eprintln!("  {:.1} MB", done as f64 / 1_048_576.0),
+            }
+        }
+        true
+    }) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return 1;
+        }
+    };
+    println!("Downloaded and checked: {}", prepared.file.display());
+    if mode == UpdateMode::DownloadOnly {
+        return 0;
+    }
+    match update::apply(&prepared, &exe, false) {
+        Ok(()) => {
+            match kind {
+                InstallKind::Installed => {
+                    println!(
+                        "Installing {} in the background (close SentinelTask if it is open).",
+                        release.version
+                    )
+                }
+                InstallKind::Portable => println!("Updated {} to {}.", exe.display(), release.version),
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
     }
 }
 
@@ -421,6 +509,16 @@ mod tests {
         assert!(parse(&a(&["play", "f", "--speed", "1000"])).is_err());
         assert!(parse(&a(&["play", "f", "--bogus"])).is_err());
         assert!(parse(&a(&["--bogus"])).is_err());
+        assert_eq!(parse(&a(&["update"])).unwrap(), Command::Update(UpdateMode::Apply));
+        assert_eq!(
+            parse(&a(&["update", "--check"])).unwrap(),
+            Command::Update(UpdateMode::Check)
+        );
+        assert_eq!(
+            parse(&a(&["update", "--download-only"])).unwrap(),
+            Command::Update(UpdateMode::DownloadOnly)
+        );
+        assert!(parse(&a(&["update", "--now"])).is_err());
     }
 
     #[test]
