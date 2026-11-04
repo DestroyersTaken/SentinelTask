@@ -64,8 +64,15 @@ full write-up is in [`docs/RESEARCH.md`](docs/RESEARCH.md).
 
 ## Getting started
 
-1. Download `SentinelTask.exe` from the latest release (or the latest
-   successful **CI** run's artifacts) and run it — no installer needed.
+1. Download one of these from the latest release (or the latest successful
+   **CI** run's *SentinelTask-setup-and-zip* artifact):
+   - **`SentinelTask-<version>-setup.exe`** — installer. Per-user, no
+     administrator rights needed; adds Start menu / desktop shortcuts and lets
+     you double-click `.stmacro` files. Uninstall from *Settings → Apps*; your
+     macros are kept.
+   - **`SentinelTask-<version>-portable.zip`** — unzip anywhere and run
+     `SentinelTask.exe`. Settings and macros stay in that folder (delete
+     `portable.txt` to store them in your profile instead).
 2. Press **Record** (or `Ctrl+Alt+Shift+R`), do what you want automated, then
    press it again to stop. The recording is saved to your library automatically.
 3. Press **Play** (or `Ctrl+Alt+Shift+P`). Choose speed and repeat options on
@@ -106,7 +113,15 @@ Requires [Rust](https://rustup.rs) 1.85 or newer.
 cargo build --release
 ```
 
-The executable is `target/release/SentinelTask.exe`. Run the tests with:
+The executable is `target/release/SentinelTask.exe`. To build the portable
+zip and the installer into `dist/` (needs `zip` and `nsis`):
+
+```bash
+packaging/make-dist.sh                      # cross-compiles with MinGW
+packaging/make-dist.sh path/to/SentinelTask.exe
+```
+
+Run the tests with:
 
 ```bash
 cargo test --workspace

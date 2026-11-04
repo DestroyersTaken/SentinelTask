@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,18 +18,29 @@ jobs:
         run: cargo test --workspace
       - name: Build
         run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: exe
+          path: target/release/SentinelTask.exe
+
+  publish:
+    needs: build
+    # NSIS on Linux ships the 64-bit (amd64-unicode) installer stubs.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: exe
+          path: build
+      - name: Install NSIS
+        run: sudo apt-get update && sudo apt-get install -y nsis zip
       - name: Package
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target/release/SentinelTask.exe dist/
-          Copy-Item README.md, LICENSE dist/
-          Compress-Archive -Path dist/* -DestinationPath SentinelTask-${{ github.ref_name }}-windows-x64.zip
-          Get-FileHash dist/SentinelTask.exe -Algorithm SHA256 | Format-List | Out-File SHA256SUMS.txt
+        run: packaging/make-dist.sh build/SentinelTask.exe
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            SentinelTask-${{ github.ref_name }}-windows-x64.zip
-            dist/SentinelTask.exe
-            SHA256SUMS.txt
+            dist/SentinelTask-*-setup.exe
+            dist/SentinelTask-*-portable.zip
+            dist/SHA256SUMS.txt
           generate_release_notes: true

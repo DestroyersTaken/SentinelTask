@@ -73,6 +73,11 @@ fn wide(s: &str) -> Vec<u16> {
 pub fn init_process() {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // Named mutex the installer/uninstaller checks so it can ask the
+        // user to close SentinelTask before replacing its files. The handle
+        // is intentionally never closed; Windows releases it at exit.
+        let name = wide("SentinelTask.Running");
+        windows_sys::Win32::System::Threading::CreateMutexW(null(), 0, name.as_ptr());
     }
     let _ = qpc_freq();
 }

@@ -1,0 +1,8 @@
+SentinelTask — portable mode
+
+Because this file is here, SentinelTask keeps its settings, macro library
+("Macros" folder) and logs next to SentinelTask.exe instead of in your user
+profile. That makes the whole folder easy to carry on a USB stick.
+
+Delete this file to store settings and macros in your user profile instead
+(%APPDATA%\SentinelTask and Documents\SentinelTask).
