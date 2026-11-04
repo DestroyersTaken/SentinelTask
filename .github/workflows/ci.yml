@@ -31,9 +31,13 @@ jobs:
         run: cargo build --release
       - name: Smoke test
         shell: pwsh
+        # SentinelTask.exe is a GUI-subsystem program, so PowerShell doesn't
+        # wait for it or set $LASTEXITCODE; wait explicitly instead.
         run: |
-          ./target/release/SentinelTask.exe --version
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $p = Start-Process -FilePath target/release/SentinelTask.exe -ArgumentList '--version' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { Write-Error "exit code $($p.ExitCode)"; exit 1 }
+          $p = Start-Process -FilePath target/release/SentinelTask.exe -ArgumentList 'info','does-not-exist.stmacro' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 1) { Write-Error "expected exit code 1 for a missing file, got $($p.ExitCode)"; exit 1 }
       - uses: actions/upload-artifact@v4
         with:
           name: SentinelTask-windows-x64
