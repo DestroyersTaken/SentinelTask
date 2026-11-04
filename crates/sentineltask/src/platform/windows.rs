@@ -563,17 +563,21 @@ impl Injector {
             }
             EventKind::MouseButton { button, down, x, y } => {
                 if self.mode == MouseMode::Absolute {
-                    // Position and button travel in ONE input event, so the
-                    // click can never land before the move is applied
-                    // (SendInput is asynchronous).
+                    // The button event carries its own position, so the
+                    // click can never land before a move is applied
+                    // (SendInput is asynchronous). If the cursor isn't there
+                    // yet, a plain move goes first in the SAME SendInput
+                    // call: many games (Roblox included) only register a
+                    // click after they have seen the cursor arrive.
                     let (ax, ay) = to_absolute(x, y, self.desktop);
                     let (flag, data) = button_flags(button, down);
-                    self.send(&[Self::mouse_input(
-                        ax,
-                        ay,
-                        data,
-                        flag | MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
-                    )]);
+                    let abs = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+                    let click = Self::mouse_input(ax, ay, data, flag | abs);
+                    if self.last_abs != Some((x, y)) {
+                        self.send(&[Self::mouse_input(ax, ay, 0, abs), click]);
+                    } else {
+                        self.send(&[click]);
+                    }
                     self.last_abs = Some((x, y));
                 } else {
                     self.button(button, down);
@@ -1870,6 +1874,94 @@ mod real_windows {
             !got.iter()
                 .any(|k| matches!(k, EventKind::Key { key, .. } if key.vk == vk::F1 + 19)),
             "our own injected key was recorded"
+        );
+
+        // 5b. Mouse clicks are recorded with their position (an empty spot
+        //     on the desktop: right edge, vertical middle).
+        let prim = screen_info().primary;
+        let (cx, cy) = (prim.right() - 40, prim.y + prim.h / 2);
+        svc.set_capture(Some(CaptureConfig {
+            mouse_moves: false,
+            raw_deltas: false,
+            buttons: true,
+            keyboard: false,
+        }));
+        std::thread::sleep(Duration::from_millis(200));
+        while captured.try_recv().is_ok() {}
+        let (ax, ay) = to_absolute(cx, cy, desk);
+        user_mouse(
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            ax,
+            ay,
+            0,
+        );
+        user_mouse(MOUSEEVENTF_LEFTDOWN, 0, 0, 0);
+        user_mouse(MOUSEEVENTF_LEFTUP, 0, 0, 0);
+        std::thread::sleep(Duration::from_millis(300));
+        svc.set_capture(None);
+        let clicks: Vec<EventKind> = captured.try_iter().map(|c| c.kind).collect();
+        let downs: Vec<_> = clicks
+            .iter()
+            .filter(|k| {
+                matches!(
+                    k,
+                    EventKind::MouseButton {
+                        button: MouseButton::Left,
+                        down: true,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        assert_eq!(downs.len(), 1, "left click recorded once: {clicks:?}");
+        if let EventKind::MouseButton { x, y, .. } = downs[0] {
+            assert!(
+                (x - cx).abs() <= 1 && (y - cy).abs() <= 1,
+                "click position ({x},{y}) vs ({cx},{cy})"
+            );
+        }
+        assert!(
+            clicks.iter().any(|k| matches!(
+                k,
+                EventKind::MouseButton {
+                    button: MouseButton::Left,
+                    down: false,
+                    ..
+                }
+            )),
+            "left release recorded: {clicks:?}"
+        );
+
+        // 5c. "Pick on screen" for the auto clicker reports the clicked spot.
+        drain(&events);
+        svc.begin_point_pick(true);
+        std::thread::sleep(Duration::from_millis(200));
+        let (px, py) = (cx - 10, cy + 10);
+        let (ax, ay) = to_absolute(px, py, desk);
+        user_mouse(
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            ax,
+            ay,
+            0,
+        );
+        user_mouse(MOUSEEVENTF_LEFTDOWN, 0, 0, 0);
+        user_mouse(MOUSEEVENTF_LEFTUP, 0, 0, 0);
+        match next_event(&events, 2000) {
+            Some(PlatformEvent::PointPicked(Some((x, y)))) => {
+                assert!(
+                    (x - px).abs() <= 1 && (y - py).abs() <= 1,
+                    "picked ({x},{y}) vs ({px},{py})"
+                )
+            }
+            other => panic!("expected a picked point, got {other:?}"),
+        }
+        // Esc cancels picking.
+        svc.begin_point_pick(true);
+        std::thread::sleep(Duration::from_millis(200));
+        user_tap(vk::ESCAPE);
+        assert!(
+            matches!(next_event(&events, 2000), Some(PlatformEvent::PointPicked(None))),
+            "Esc cancels picking"
         );
 
         // 6. Absolute positioning is pixel exact, including the far corner.
