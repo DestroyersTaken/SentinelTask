@@ -158,6 +158,9 @@ pub fn start(cfg: ClickerConfig, waker: Waker) -> ClickerHandle {
                 k += 1;
                 due += interval;
                 c2.store(k, Ordering::Relaxed);
+                if k % 16 == 0 {
+                    platform::pump_thread_messages();
+                }
                 if k % 10 == 0 {
                     waker();
                 }

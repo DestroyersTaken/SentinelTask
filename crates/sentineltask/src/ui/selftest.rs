@@ -622,6 +622,36 @@ fn scenarios() -> Vec<Scenario> {
             ],
         },
         Scenario {
+            name: "no_memory_growth_during_long_playback",
+            steps: vec![
+                act("play forever with the overlay", |app, ctx| {
+                    load(app, demo_macro());
+                    app.start_playback(ctx, false);
+                }),
+                until("playing", 3000, playing),
+                wait(5000), // warm-up: caches, font atlas, overlay window
+                {
+                    let mut start: Option<(Instant, isize)> = None;
+                    step("heap stays flat for 30 s", 40_000, move |_, _| {
+                        let (t0, h0) = *start.get_or_insert((Instant::now(), crate::live_heap_bytes()));
+                        if t0.elapsed() < Duration::from_secs(30) {
+                            return Ok(false);
+                        }
+                        let grew = crate::live_heap_bytes() - h0;
+                        if grew > 512 * 1024 {
+                            return Err(format!(
+                                "SentinelTask's heap grew {} KB in 30 s of playback",
+                                grew / 1024
+                            ));
+                        }
+                        Ok(true)
+                    })
+                },
+                act("stop", |app, _| app.stop_playback()),
+                until("stopped", 3000, idle),
+            ],
+        },
+        Scenario {
             name: "settings_survive_restart",
             steps: vec![step("save + reload settings", 2000, |app, _| {
                 let before = app.settings.clone();

@@ -15,6 +15,55 @@ mod platform;
 mod ui;
 
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicIsize, Ordering};
+
+/// Counts live heap bytes so long-run memory can be checked
+/// (`SENTINEL_MEMLOG=1` logs it once a minute). Negligible overhead.
+struct CountingAlloc;
+
+static LIVE_BYTES: AtomicIsize = AtomicIsize::new(0);
+
+unsafe impl std::alloc::GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        let p = unsafe { std::alloc::System.alloc(layout) };
+        if !p.is_null() {
+            LIVE_BYTES.fetch_add(layout.size() as isize, Ordering::Relaxed);
+        }
+        p
+    }
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        unsafe { std::alloc::System.dealloc(ptr, layout) };
+        LIVE_BYTES.fetch_sub(layout.size() as isize, Ordering::Relaxed);
+    }
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new_size: usize) -> *mut u8 {
+        let p = unsafe { std::alloc::System.realloc(ptr, layout, new_size) };
+        if !p.is_null() {
+            LIVE_BYTES.fetch_add(new_size as isize - layout.size() as isize, Ordering::Relaxed);
+        }
+        p
+    }
+}
+
+#[global_allocator]
+static ALLOC: CountingAlloc = CountingAlloc;
+
+/// Live heap bytes allocated by SentinelTask's own code (Rust allocations).
+pub fn live_heap_bytes() -> isize {
+    LIVE_BYTES.load(Ordering::Relaxed)
+}
+
+fn start_memlog() {
+    if std::env::var("SENTINEL_MEMLOG").is_err() {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("sentinel-memlog".into())
+        .spawn(|| loop {
+            logging::log("mem", &format!("live heap {} KB", live_heap_bytes() / 1024));
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        })
+        .ok();
+}
 
 use eframe::egui;
 
@@ -118,6 +167,7 @@ fn main() -> ExitCode {
     let paths = paths::Paths::detect();
     logging::init(&paths.log_dir);
     install_panic_hook();
+    start_memlog();
     log_info!("SentinelTask {} starting", sentinel_core::APP_VERSION);
 
     let args: Vec<String> = std::env::args().skip(1).collect();

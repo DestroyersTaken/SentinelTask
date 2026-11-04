@@ -310,6 +310,7 @@ fn play_loop(
                     return FinishReason::Stopped;
                 }
                 std::thread::sleep(Duration::from_millis(20));
+                platform::pump_thread_messages();
                 let still_user = ctl.pause.load(Ordering::SeqCst);
                 if let Some(p) = &focus {
                     focus_ok = platform::foreground_window().is_some_and(|w| w.matches_process(p));
@@ -360,6 +361,10 @@ fn play_loop(
         let real_now = platform::now_us();
         if real_now.saturating_sub(last_status) >= 16_000 {
             last_status = real_now;
+            // Injecting from a thread that never pumps messages lets per-
+            // thread input bookkeeping pile up over a long run (measured:
+            // ~220 bytes per injected move). Drain it regularly.
+            platform::pump_thread_messages();
             update_status(status, &player, run_now, injected, inj.failures());
             if real_now.saturating_sub(last_wake) >= 100_000 {
                 last_wake = real_now;

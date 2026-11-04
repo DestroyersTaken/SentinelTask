@@ -1150,9 +1150,14 @@ impl eframe::App for SentinelApp {
         }
 
         let busy = !self.mode.is_idle();
-        if busy {
-            // Keep the click-through status overlay updating even while the
-            // main window is minimized.
+        // Keep the click-through status overlay updating while the main
+        // window is minimized. Only send this while actually hidden: queued
+        // viewport commands are only drained by a painted frame.
+        let hidden = ctx.input(|i| {
+            let v = i.viewport();
+            v.minimized == Some(true) || v.visible() == Some(false)
+        });
+        if busy && hidden {
             ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaintWhileHidden);
         }
         ctx.request_repaint_after(if busy {

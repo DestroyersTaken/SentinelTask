@@ -243,3 +243,5 @@ pub fn overlay_window_state() -> (bool, bool, bool, bool) {
 pub fn running_under_wine() -> bool {
     false
 }
+
+pub fn pump_thread_messages() {}

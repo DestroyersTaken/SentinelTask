@@ -711,6 +711,19 @@ pub fn set_virtual_key_injection(on: bool) {
     VK_INJECTION.store(on, Ordering::Relaxed);
 }
 
+/// Drain the calling thread's message queue. Injecting input from a thread
+/// that never pumps messages lets per-thread input bookkeeping pile up over
+/// a long run; the playback and clicker threads call this regularly.
+pub fn pump_thread_messages() {
+    unsafe {
+        let mut msg: MSG = zeroed();
+        let mut n = 0;
+        while n < 10_000 && PeekMessageW(&mut msg, null_mut(), 0, 0, PM_REMOVE) != 0 {
+            n += 1;
+        }
+    }
+}
+
 /// Release whatever the active injector holds (panic hook / exit path).
 pub fn emergency_release_all() {
     let held = GLOBAL_HELD.lock().take();
@@ -2112,5 +2125,120 @@ pub fn running_under_wine() -> bool {
         !h.is_null()
             && windows_sys::Win32::System::LibraryLoader::GetProcAddress(h, c"wine_get_version".as_ptr().cast())
                 .is_some()
+    }
+}
+
+/// Leak checks against the real Windows APIs the engine calls in a loop
+/// during long runs. Ignored by default; run in CI with `--ignored`.
+#[cfg(test)]
+mod leak_checks {
+    use super::*;
+    use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+
+    /// Private (committed) bytes of this process.
+    fn private_bytes() -> i64 {
+        unsafe {
+            let mut c: PROCESS_MEMORY_COUNTERS = zeroed();
+            c.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+            K32GetProcessMemoryInfo(GetCurrentProcess(), &mut c, c.cb);
+            c.PagefileUsage as i64
+        }
+    }
+
+    fn measure(name: &str, rounds: usize, mut f: impl FnMut()) -> i64 {
+        for _ in 0..rounds / 10 {
+            f(); // warm up caches and allocator pools
+        }
+        let a = private_bytes();
+        for _ in 0..rounds {
+            f();
+        }
+        let grew = private_bytes() - a;
+        eprintln!("{name}: {rounds} rounds, private bytes +{} KB", grew / 1024);
+        grew
+    }
+
+    #[test]
+    #[ignore = "sends real input; run on a Windows desktop with --ignored"]
+    fn long_runs_do_not_leak() {
+        let desk = screen_info().desktop;
+        let (cx, cy) = (desk.x + desk.w / 2, desk.y + desk.h / 2);
+        let mut inj = Injector::new(MouseMode::Absolute);
+        let mut i = 0i32;
+        let inject = measure("SendInput mouse moves", 50_000, || {
+            i = (i + 1) % 200;
+            inj.inject(&EventKind::MouseMove { x: cx + i, y: cy }, false);
+            if i == 0 {
+                pump_thread_messages();
+            }
+        });
+        let mut sleeper = Sleeper::new();
+        let sleep = measure("high-resolution waits", 5_000, || {
+            sleeper.wait_until(now_us() + 200);
+        });
+        let fg = measure("foreground window queries", 5_000, || {
+            let _ = foreground_window();
+        });
+        let mut keys = 0u32;
+        let key = measure("SendInput key taps", 10_000, || {
+            keys += 1;
+            inj.inject(
+                &EventKind::Key {
+                    key: Key::from_vk(vkc::F1 + 23),
+                    down: true,
+                },
+                false,
+            );
+            inj.inject(
+                &EventKind::Key {
+                    key: Key::from_vk(vkc::F1 + 23),
+                    down: false,
+                },
+                false,
+            );
+        });
+        drop(inj);
+        // A whole playback run, many passes.
+        let events: Vec<sentinel_core::Event> = (0..200u64)
+            .map(|t| {
+                sentinel_core::Event::new(
+                    t * 100,
+                    EventKind::MouseMove {
+                        x: cx + (t % 50) as i32,
+                        y: cy,
+                    },
+                )
+            })
+            .collect();
+        let play = measure("playback runs (200 events x 20 passes)", 30, || {
+            let req = crate::engine::player::PlayRequest {
+                events: std::sync::Arc::new(events.clone()),
+                opts: sentinel_core::PlaybackOptions {
+                    repeat: sentinel_core::Repeat::Times { count: 20 },
+                    speed: 100.0,
+                    ..Default::default()
+                },
+                recorded_screen: None,
+                focus_process: None,
+                countdown_secs: 0,
+                keep_awake: true,
+                wait_for_modifiers: false,
+            };
+            crate::engine::player::start(req, std::sync::Arc::new(|| {})).join();
+        });
+        // Generous bounds: allocator noise is fine, steady growth is not.
+        for (name, grew) in [
+            ("SendInput mouse moves", inject),
+            ("waits", sleep),
+            ("foreground queries", fg),
+            ("key taps", key),
+            ("playback runs", play),
+        ] {
+            assert!(
+                grew < 2 * 1024 * 1024,
+                "{name} grew private bytes by {} KB",
+                grew / 1024
+            );
+        }
     }
 }
