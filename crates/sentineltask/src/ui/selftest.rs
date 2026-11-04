@@ -198,6 +198,10 @@ fn scenarios() -> Vec<Scenario> {
                     Some(r) if r.starts_with("Stopped") => Ok(()),
                     other => Err(format!("last run {other:?}")),
                 }),
+                act("restore window", |_, ctx| {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false))
+                }),
+                wait(800),
             ],
         },
         Scenario {
@@ -298,8 +302,10 @@ fn scenarios() -> Vec<Scenario> {
                     app.start_playback(ctx, false);
                 }),
                 until("playing", 3000, playing),
+                // Wine's GetAsyncKeyState doesn't reliably report injected
+                // F13-F24; real Windows does (checked strictly there).
                 step("F24 is held", 2000, move |_, _| {
-                    Ok(!cfg!(windows) || platform::key_is_down(f24))
+                    Ok(!cfg!(windows) || platform::running_under_wine() || platform::key_is_down(f24))
                 }),
                 act("press emergency stop", press(|a| a.settings.hotkeys.emergency_stop)),
                 until("stopped", 3000, idle),
