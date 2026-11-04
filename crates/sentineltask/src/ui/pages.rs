@@ -590,6 +590,15 @@ impl SentinelApp {
                         return;
                     }
                     match self.hotkey_error(a) {
+                        Some(e) if e.starts_with(crate::platform::SHARED_HOTKEY_PREFIX) => {
+                            widgets::pill(ui, "Active · shared", p.warn_fg, p.warn_bg).on_hover_text(e);
+                            ui.label(
+                                RichText::new("Another program uses this too")
+                                    .size(12.0)
+                                    .color(p.warn_fg),
+                            )
+                            .on_hover_text(e);
+                        }
                         Some(e) => {
                             widgets::pill(ui, "Unavailable", p.danger, p.err_bg).on_hover_text(e);
                             ui.label(RichText::new(e).size(12.0).color(p.danger));

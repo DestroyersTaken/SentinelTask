@@ -114,6 +114,20 @@ pub struct HotkeyRegistration {
     pub error: Option<String>,
 }
 
+/// Prefix of the message for a hotkey that another program has registered
+/// too. SentinelTask's keyboard hook still receives it, so it *works* — it
+/// is a warning (the other program may react as well), not a failure.
+pub const SHARED_HOTKEY_PREFIX: &str = "Also used by another program";
+
+impl HotkeyRegistration {
+    /// The hotkey will not work at all.
+    pub fn is_broken(&self) -> bool {
+        self.error
+            .as_deref()
+            .is_some_and(|e| !e.starts_with(SHARED_HOTKEY_PREFIX))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct WindowInfo {
     pub pid: u32,

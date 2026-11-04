@@ -58,6 +58,7 @@ impl SentinelApp {
         let failed: Vec<String> = self
             .hotkey_status
             .iter()
+            .filter(|r| r.is_broken())
             .filter_map(|r| {
                 r.error
                     .as_ref()

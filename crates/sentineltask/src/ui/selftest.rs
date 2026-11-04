@@ -96,7 +96,7 @@ impl SentinelApp {
         }
         match t.stage {
             0 if secs >= 3.0 => {
-                if let Some(r) = self.hotkey_status.iter().find(|r| r.error.is_some()) {
+                if let Some(r) = self.hotkey_status.iter().find(|r| r.is_broken()) {
                     finish(
                         &out,
                         Err(format!("hotkey {:?} not registered: {:?}", r.action, r.error)),

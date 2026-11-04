@@ -1232,7 +1232,10 @@ unsafe fn apply_hotkeys(st: &mut ServiceState) -> Vec<HotkeyRegistration> {
             // will usually react too, so tell the user.
             let err = GetLastError();
             Some(if err == ERROR_HOTKEY_ALREADY_REGISTERED {
-                "Also used by another program — choose a different combination".into()
+                format!(
+                    "{} — it still works, but that program may react to it too",
+                    super::SHARED_HOTKEY_PREFIX
+                )
             } else {
                 format!("Windows refused this hotkey (error {err})")
             })
