@@ -12,6 +12,88 @@ use crate::platform::{self, HotkeyAction};
 use super::app::{Modal, Mode, Page, SentinelApp, ToastKind};
 use super::widgets::{self, BannerKind, Icon};
 
+/// Map an egui key to a Windows virtual-key code.
+pub fn egui_key_to_vk(k: egui::Key) -> Option<u16> {
+    use egui::Key as K;
+    use sentinel_core::keys::vk;
+    let code = match k {
+        K::ArrowDown => vk::DOWN,
+        K::ArrowLeft => vk::LEFT,
+        K::ArrowRight => vk::RIGHT,
+        K::ArrowUp => vk::UP,
+        K::Escape => vk::ESCAPE,
+        K::Tab => vk::TAB,
+        K::Backspace => vk::BACK,
+        K::Enter => vk::RETURN,
+        K::Space => vk::SPACE,
+        K::Insert => vk::INSERT,
+        K::Delete => vk::DELETE,
+        K::Home => vk::HOME,
+        K::End => vk::END,
+        K::PageUp => vk::PRIOR,
+        K::PageDown => vk::NEXT,
+        K::Comma => 0xBC,
+        K::Minus => 0xBD,
+        K::Period => 0xBE,
+        K::Slash => 0xBF,
+        K::Backtick => 0xC0,
+        K::OpenBracket => 0xDB,
+        K::Backslash => 0xDC,
+        K::CloseBracket => 0xDD,
+        K::Quote => 0xDE,
+        K::Semicolon => 0xBA,
+        K::Equals => 0xBB,
+        K::Pause => vk::PAUSE,
+        K::ScrollLock => vk::SCROLL,
+        K::PrintScreen => vk::SNAPSHOT,
+        K::CapsLock => vk::CAPITAL,
+        K::NumLock => vk::NUMLOCK,
+        K::Menu => vk::APPS,
+        _ => {
+            let name = k.name();
+            let b = name.as_bytes();
+            if b.len() == 1 && (b[0].is_ascii_uppercase() || b[0].is_ascii_digit()) {
+                b[0] as u16
+            } else {
+                let n = name.strip_prefix('F').and_then(|n| n.parse::<u16>().ok())?;
+                if !(1..=24).contains(&n) {
+                    return None;
+                }
+                vk::F1 + n - 1
+            }
+        }
+    };
+    Some(code)
+}
+
+/// The hotkey chosen by a key press in SentinelTask's own window, if any:
+/// `Some(None)` = Esc (cancel), `Some(Some(hk))` = chosen, `None` = nothing yet.
+fn captured_from_events(events: &[egui::Event]) -> Option<Option<sentinel_core::keys::Hotkey>> {
+    for e in events {
+        if let egui::Event::Key {
+            key,
+            pressed: true,
+            repeat: false,
+            modifiers,
+            ..
+        } = e
+        {
+            let Some(code) = egui_key_to_vk(*key) else { continue };
+            if code == sentinel_core::keys::vk::ESCAPE && !modifiers.any() {
+                return Some(None);
+            }
+            return Some(Some(sentinel_core::keys::Hotkey {
+                ctrl: modifiers.ctrl,
+                alt: modifiers.alt,
+                shift: modifiers.shift,
+                win: false,
+                vk: code,
+            }));
+        }
+    }
+    None
+}
+
 fn ago(t: std::time::SystemTime) -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(t)
@@ -249,6 +331,7 @@ impl SentinelApp {
 
         let mut changed = false;
         let mut pick = false;
+        let mut cancel_pick = self.picking_point && ui.input(|i| i.key_pressed(egui::Key::Escape));
         ui.add_enabled_ui(idle, |ui| {
             widgets::card(ui, &p, |ui| {
                 widgets::card_title(ui, &p, "What to click", None);
@@ -337,10 +420,15 @@ impl SentinelApp {
                     if let ClickLocation::Fixed { x, y } = &mut c.location {
                         changed |= ui.add(egui::DragValue::new(x).prefix("x ")).changed();
                         changed |= ui.add(egui::DragValue::new(y).prefix("y ")).changed();
-                        pick = ui
-                            .button("Pick on screen…")
-                            .on_hover_text("Then left-click the spot (Esc cancels)")
-                            .clicked();
+                        if self.picking_point {
+                            cancel_pick = ui.button("Cancel picking").clicked();
+                            ui.label(RichText::new("Left-click the spot…").color(p.accent));
+                        } else {
+                            pick = ui
+                                .button("Pick on screen…")
+                                .on_hover_text("Then left-click the spot (Esc cancels)")
+                                .clicked();
+                        }
                     }
                 });
             });
@@ -427,6 +515,9 @@ impl SentinelApp {
         if changed {
             self.mark_settings_dirty();
         }
+        if cancel_pick {
+            self.cancel_point_pick();
+        }
         if pick {
             self.picking_point = true;
             self.service.begin_point_pick(true);
@@ -440,6 +531,15 @@ impl SentinelApp {
 
     pub fn page_settings(&mut self, ui: &mut egui::Ui) {
         let p = self.palette;
+        // Fallback for choosing a hotkey: if the system-wide keyboard hook
+        // can't deliver (blocked by security software, etc.), read the keys
+        // straight from SentinelTask's own window.
+        if self.capturing_hotkey.is_some() {
+            if let Some(result) = ui.input(|i| captured_from_events(&i.events)) {
+                self.finish_key_capture(result);
+            }
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
         widgets::page_header(
             ui,
             &p,
@@ -468,7 +568,7 @@ impl SentinelApp {
                     );
                     let capturing = self.capturing_hotkey == Some(a);
                     let label = if capturing {
-                        "Press keys… (Esc to cancel)".to_string()
+                        "Press the new keys…".to_string()
                     } else {
                         self.hotkey_text(a)
                     };
@@ -480,9 +580,14 @@ impl SentinelApp {
                         .clicked()
                         && !capturing
                     {
-                        self.capturing_hotkey = Some(a);
-                        self.service.suspend_hotkeys(true);
-                        self.service.begin_key_capture(true);
+                        self.begin_key_capture(a);
+                    }
+                    if capturing {
+                        if ui.button("Cancel").clicked() {
+                            self.finish_key_capture(None);
+                        }
+                        ui.label(RichText::new("or press Esc").size(12.0).color(p.text_faint));
+                        return;
                     }
                     match self.hotkey_error(a) {
                         Some(e) => {
@@ -825,5 +930,53 @@ impl SentinelApp {
             "SentinelTask automates your own mouse and keyboard. Many online games forbid automation in their rules — check before you use it there.",
             &[],
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sentinel_core::keys::{vk, Hotkey};
+
+    fn key_event(key: egui::Key, modifiers: egui::Modifiers, repeat: bool) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat,
+            modifiers,
+        }
+    }
+
+    #[test]
+    fn egui_keys_map_to_virtual_keys() {
+        assert_eq!(egui_key_to_vk(egui::Key::R), Some(0x52));
+        assert_eq!(egui_key_to_vk(egui::Key::Num7), Some(0x37));
+        assert_eq!(egui_key_to_vk(egui::Key::F8), Some(vk::F1 + 7));
+        assert_eq!(egui_key_to_vk(egui::Key::F24), Some(vk::F24));
+        assert_eq!(egui_key_to_vk(egui::Key::F25), None);
+        assert_eq!(egui_key_to_vk(egui::Key::Pause), Some(vk::PAUSE));
+        assert_eq!(egui_key_to_vk(egui::Key::ArrowUp), Some(vk::UP));
+    }
+
+    #[test]
+    fn in_window_capture_reads_chords_and_escape() {
+        let m = egui::Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            captured_from_events(&[key_event(egui::Key::R, m, false)]),
+            Some(Some(Hotkey::with(true, false, true, 0x52)))
+        );
+        assert_eq!(
+            captured_from_events(&[key_event(egui::Key::Escape, egui::Modifiers::NONE, false)]),
+            Some(None)
+        );
+        // Auto-repeat and unmapped keys are ignored.
+        assert_eq!(captured_from_events(&[key_event(egui::Key::R, m, true)]), None);
+        assert_eq!(captured_from_events(&[key_event(egui::Key::F30, m, false)]), None);
+        assert_eq!(captured_from_events(&[]), None);
     }
 }

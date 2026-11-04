@@ -544,16 +544,10 @@ impl Injector {
         self.last_abs = Some((x, y));
     }
 
-    /// Put the cursor exactly on (x, y) before a click. `SendInput`'s
-    /// normalised coordinates can land one pixel off on unusual layouts;
-    /// correct small errors with `SetCursorPos` (which is pixel exact).
+    /// Move the cursor to (x, y) (no-op if already sent there).
     fn ensure_at(&mut self, x: i32, y: i32) {
         if self.last_abs != Some((x, y)) {
             self.move_abs(x, y);
-        }
-        let (cx, cy) = cursor_pos();
-        if (cx, cy) != (x, y) && (cx - x).abs() <= 2 && (cy - y).abs() <= 2 {
-            unsafe { SetCursorPos(x, y) };
         }
     }
 
@@ -576,9 +570,21 @@ impl Injector {
             }
             EventKind::MouseButton { button, down, x, y } => {
                 if self.mode == MouseMode::Absolute {
-                    self.ensure_at(x, y);
+                    // Position and button travel in ONE input event, so the
+                    // click can never land before the move is applied
+                    // (SendInput is asynchronous).
+                    let (ax, ay) = to_absolute(x, y, self.desktop);
+                    let (flag, data) = button_flags(button, down);
+                    self.send(&[Self::mouse_input(
+                        ax,
+                        ay,
+                        data,
+                        flag | MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                    )]);
+                    self.last_abs = Some((x, y));
+                } else {
+                    self.button(button, down);
                 }
-                self.button(button, down);
             }
             EventKind::Wheel {
                 delta,
@@ -603,18 +609,7 @@ impl Injector {
     }
 
     fn button(&mut self, button: MouseButton, down: bool) {
-        let (flag, data) = match (button, down) {
-            (MouseButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
-            (MouseButton::Left, false) => (MOUSEEVENTF_LEFTUP, 0),
-            (MouseButton::Right, true) => (MOUSEEVENTF_RIGHTDOWN, 0),
-            (MouseButton::Right, false) => (MOUSEEVENTF_RIGHTUP, 0),
-            (MouseButton::Middle, true) => (MOUSEEVENTF_MIDDLEDOWN, 0),
-            (MouseButton::Middle, false) => (MOUSEEVENTF_MIDDLEUP, 0),
-            (MouseButton::X1, true) => (MOUSEEVENTF_XDOWN, XBUTTON1 as u32),
-            (MouseButton::X1, false) => (MOUSEEVENTF_XUP, XBUTTON1 as u32),
-            (MouseButton::X2, true) => (MOUSEEVENTF_XDOWN, XBUTTON2 as u32),
-            (MouseButton::X2, false) => (MOUSEEVENTF_XUP, XBUTTON2 as u32),
-        };
+        let (flag, data) = button_flags(button, down);
         self.send(&[Self::mouse_input(0, 0, data, flag)]);
     }
 
@@ -664,6 +659,21 @@ impl Drop for Injector {
     fn drop(&mut self) {
         self.release_all();
         *GLOBAL_HELD.lock() = None;
+    }
+}
+
+fn button_flags(button: MouseButton, down: bool) -> (MOUSE_EVENT_FLAGS, u32) {
+    match (button, down) {
+        (MouseButton::Left, true) => (MOUSEEVENTF_LEFTDOWN, 0),
+        (MouseButton::Left, false) => (MOUSEEVENTF_LEFTUP, 0),
+        (MouseButton::Right, true) => (MOUSEEVENTF_RIGHTDOWN, 0),
+        (MouseButton::Right, false) => (MOUSEEVENTF_RIGHTUP, 0),
+        (MouseButton::Middle, true) => (MOUSEEVENTF_MIDDLEDOWN, 0),
+        (MouseButton::Middle, false) => (MOUSEEVENTF_MIDDLEUP, 0),
+        (MouseButton::X1, true) => (MOUSEEVENTF_XDOWN, XBUTTON1 as u32),
+        (MouseButton::X1, false) => (MOUSEEVENTF_XUP, XBUTTON1 as u32),
+        (MouseButton::X2, true) => (MOUSEEVENTF_XDOWN, XBUTTON2 as u32),
+        (MouseButton::X2, false) => (MOUSEEVENTF_XUP, XBUTTON2 as u32),
     }
 }
 
@@ -718,13 +728,7 @@ pub fn emergency_release_all() {
         for r in releases {
             match r {
                 EventKind::MouseButton { button, .. } => {
-                    let (flag, data) = match button {
-                        MouseButton::Left => (MOUSEEVENTF_LEFTUP, 0),
-                        MouseButton::Right => (MOUSEEVENTF_RIGHTUP, 0),
-                        MouseButton::Middle => (MOUSEEVENTF_MIDDLEUP, 0),
-                        MouseButton::X1 => (MOUSEEVENTF_XUP, XBUTTON1 as u32),
-                        MouseButton::X2 => (MOUSEEVENTF_XUP, XBUTTON2 as u32),
-                    };
+                    let (flag, data) = button_flags(button, false);
                     inputs.push(Injector::mouse_input(0, 0, data, flag));
                 }
                 EventKind::Key { key, .. } => inputs.push(key_to_input(key, false)),
@@ -772,20 +776,99 @@ static HOTKEY_VKS: [AtomicU64; 4] = [
 ];
 static KB_HOOK: AtomicIsize = AtomicIsize::new(0);
 static MS_HOOK: AtomicIsize = AtomicIsize::new(0);
+static SERVICE_HWND: AtomicIsize = AtomicIsize::new(0);
+/// Packed hotkey per action (see [`pack_hotkey`]); 0 = none.
+static HOTKEY_DEFS: [AtomicU32; 5] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+/// False while the user is choosing a new hotkey in Settings.
+static HOTKEYS_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Main key of a hotkey that is currently held down: its auto-repeats and
+/// its key-up are swallowed so the target program never sees half a chord.
+static HOTKEY_HELD: AtomicU32 = AtomicU32::new(0);
+/// When the held hotkey key was last seen (ms); auto-repeat refreshes it.
+static HOTKEY_HELD_AT: AtomicU64 = AtomicU64::new(0);
+/// Longer than the slowest Windows keyboard repeat delay (1 s), so a held
+/// marker whose key-up was somehow missed can never swallow a later press.
+const HELD_STALE_MS: u64 = 1_100;
+/// (action id << 48) | milliseconds of the last hotkey emitted, for dedupe.
+static LAST_HOTKEY: AtomicU64 = AtomicU64::new(0);
 
 const ACTIVITY_THRESHOLD: i64 = 40;
 /// `RAWMOUSE.usFlags` bit for absolute (tablet / remote desktop) motion.
 const MOUSE_MOVE_ABSOLUTE: u16 = 0x01;
 const WM_APP_CMD: u32 = WM_APP + 1;
+/// Posted by hook callbacks so the (potentially slower) UI wake-up runs
+/// outside the hook, which must return immediately.
+const WM_APP_WAKE: u32 = WM_APP + 2;
+const TIMER_REHOOK: usize = 1;
+const REHOOK_INTERVAL_MS: u32 = 20_000;
+
+fn pack_hotkey(h: &Hotkey) -> u32 {
+    if h.vk == 0 {
+        return 0;
+    }
+    h.vk as u32 | (h.ctrl as u32) << 16 | (h.alt as u32) << 17 | (h.shift as u32) << 18 | (h.win as u32) << 19
+}
+
+/// Which hotkey (if any) the key `vk` completes, given the modifiers held
+/// right now. Modifiers must match exactly, like `RegisterHotKey`.
+fn match_hotkey(vk: u16) -> Option<HotkeyAction> {
+    if !HOTKEYS_ENABLED.load(Ordering::Relaxed) || sentinel_core::keys::is_modifier_vk(vk) {
+        return None;
+    }
+    let mods = (key_down_now(vkc::CONTROL) as u32) << 16
+        | (key_down_now(vkc::MENU) as u32) << 17
+        | (key_down_now(vkc::SHIFT) as u32) << 18
+        | ((key_down_now(vkc::LWIN) || key_down_now(vkc::RWIN)) as u32) << 19;
+    let want = vk as u32 | mods;
+    HotkeyAction::ALL
+        .into_iter()
+        .zip(HOTKEY_DEFS.iter())
+        .find(|(_, d)| d.load(Ordering::Relaxed) == want)
+        .map(|(a, _)| a)
+}
+
+fn now_ms() -> u64 {
+    now_us() / 1000
+}
 
 fn hotkey_vk_set(code: u16) -> bool {
     let c = (code & 0xFF) as usize;
     HOTKEY_VKS[c / 64].load(Ordering::Relaxed) & (1u64 << (c % 64)) != 0
 }
 
+/// Queue a platform event. Safe to call from hook callbacks: it only does a
+/// lock-free channel send and posts a message; the UI wake-up happens later
+/// in the service window procedure.
 fn emit(ev: PlatformEvent) {
+    if let PlatformEvent::Hotkey(a) = ev {
+        // The same hotkey can arrive through both the keyboard hook and
+        // RegisterHotKey in rare cases; never act on it twice.
+        let now = now_ms() & 0xFFFF_FFFF_FFFF;
+        let key = (a.id() as u64) << 48 | now;
+        let prev = LAST_HOTKEY.swap(key, Ordering::Relaxed);
+        if prev >> 48 == a.id() as u64 && now.saturating_sub(prev & 0xFFFF_FFFF_FFFF) < 250 {
+            return;
+        }
+    }
     if let Some(s) = SHARED.get() {
         let _ = s.event_tx.send(ev);
+    }
+    let hwnd = SERVICE_HWND.load(Ordering::Relaxed);
+    if hwnd != 0 {
+        unsafe {
+            PostMessageW(hwnd as HWND, WM_APP_WAKE, 0, 0);
+        }
+    }
+}
+
+fn wake_ui() {
+    if let Some(s) = SHARED.get() {
         (s.waker)();
     }
 }
@@ -796,9 +879,15 @@ fn capture(kind: EventKind) {
     }
 }
 
-/// Root window under the point belongs to SentinelTask (and isn't a
-/// click-through overlay)?
-unsafe fn point_is_own_window(pt: POINT) -> bool {
+/// Whether the window under a screen point belongs to SentinelTask (and
+/// isn't the click-through overlay). Used by the recorder to drop clicks on
+/// SentinelTask itself. Not called from hooks: `WindowFromPoint` may send
+/// messages to other programs' windows, which a hook must never wait on.
+pub fn point_is_own_window(x: i32, y: i32) -> bool {
+    unsafe { point_is_own_window_raw(POINT { x, y }) }
+}
+
+unsafe fn point_is_own_window_raw(pt: POINT) -> bool {
     let hwnd = WindowFromPoint(pt);
     if hwnd.is_null() {
         return false;
@@ -832,6 +921,20 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
         let down = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
         let vk_code = k.vkCode as u16;
         if !ours {
+            // Key-up (or auto-repeat) of a hotkey we already acted on.
+            let held = HOTKEY_HELD.load(Ordering::Relaxed);
+            if held != 0 && held == vk_code as u32 {
+                if !down {
+                    HOTKEY_HELD.store(0, Ordering::Relaxed);
+                    return 1;
+                }
+                let now = now_ms();
+                if now.saturating_sub(HOTKEY_HELD_AT.load(Ordering::Relaxed)) < HELD_STALE_MS {
+                    HOTKEY_HELD_AT.store(now, Ordering::Relaxed);
+                    return 1; // auto-repeat of the held hotkey
+                }
+                HOTKEY_HELD.store(0, Ordering::Relaxed); // stale: treat as a new press
+            }
             if KEY_CAPTURE.load(Ordering::Relaxed) && down {
                 if sentinel_core::keys::is_modifier_vk(vk_code) {
                     return CallNextHookEx(null_mut(), code, wparam, lparam);
@@ -860,6 +963,19 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: WPARAM, lparam: LPARA
                 POINT_PICK.store(false, Ordering::Relaxed);
                 emit(PlatformEvent::PointPicked(None));
                 return 1;
+            }
+            // Hotkeys, detected here as well as through RegisterHotKey: our
+            // hook runs before older hooks (e.g. GPU overlays that grab
+            // Alt+R), so the hotkey works even when such a program would
+            // otherwise swallow it. Swallowing the key here also means
+            // Windows doesn't send a second WM_HOTKEY for it.
+            if down {
+                if let Some(a) = match_hotkey(vk_code) {
+                    HOTKEY_HELD_AT.store(now_ms(), Ordering::Relaxed);
+                    HOTKEY_HELD.store(vk_code as u32, Ordering::Relaxed);
+                    emit(PlatformEvent::Hotkey(a));
+                    return 1;
+                }
             }
             if WATCH_KEYS.load(Ordering::Relaxed)
                 && down
@@ -933,7 +1049,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                         }
                     }
                     WM_MOUSEWHEEL | WM_MOUSEHWHEEL => {
-                        if CAP_BUTTONS.load(Ordering::Relaxed) && !point_is_own_window(m.pt) {
+                        if CAP_BUTTONS.load(Ordering::Relaxed) {
                             capture(EventKind::Wheel {
                                 delta: hi as i16 as i32,
                                 horizontal: msg == WM_MOUSEHWHEEL,
@@ -944,7 +1060,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                     }
                     _ => {
                         if let Some(b) = button {
-                            if CAP_BUTTONS.load(Ordering::Relaxed) && !point_is_own_window(m.pt) {
+                            if CAP_BUTTONS.load(Ordering::Relaxed) {
                                 capture(EventKind::MouseButton {
                                     button: b,
                                     down: is_down,
@@ -979,13 +1095,51 @@ thread_local! {
     static STATE: RefCell<Option<ServiceState>> = const { RefCell::new(None) };
 }
 
-fn need_hooks() -> bool {
+fn need_mouse_hook() -> bool {
     CAPTURING.load(Ordering::Relaxed)
         || WATCH_MOUSE.load(Ordering::Relaxed)
+        || POINT_PICK.load(Ordering::Relaxed)
+        || SWALLOW_UP.load(Ordering::Relaxed) != 0
+}
+
+fn need_keyboard_hook() -> bool {
+    HOTKEYS_ENABLED.load(Ordering::Relaxed)
+        || CAPTURING.load(Ordering::Relaxed)
         || WATCH_KEYS.load(Ordering::Relaxed)
         || KEY_CAPTURE.load(Ordering::Relaxed)
         || POINT_PICK.load(Ordering::Relaxed)
-        || SWALLOW_UP.load(Ordering::Relaxed) != 0
+        || HOTKEY_HELD.load(Ordering::Relaxed) != 0
+}
+
+unsafe fn set_hook(slot: &AtomicIsize, want: bool, kind: WINDOWS_HOOK_ID, proc_: HOOKPROC, name: &str) {
+    let cur = slot.load(Ordering::SeqCst);
+    if want && cur == 0 {
+        let h = SetWindowsHookExW(kind, proc_, GetModuleHandleW(null()), 0);
+        if h.is_null() {
+            crate::log_warn!("{name} hook failed: error {}", GetLastError());
+        }
+        slot.store(h as isize, Ordering::SeqCst);
+    } else if !want && cur != 0 {
+        UnhookWindowsHookEx(cur as HHOOK);
+        slot.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Windows removes a low-level hook without telling anyone if it ever
+/// misses `LowLevelHooksTimeout` (RESEARCH §1 #8). Re-install periodically
+/// while idle so hotkeys can never stay dead. Skipped while recording so no
+/// event falls into the gap.
+unsafe fn refresh_hooks(st: &mut ServiceState) {
+    if CAPTURING.load(Ordering::Relaxed) || KEY_CAPTURE.load(Ordering::Relaxed) {
+        return;
+    }
+    for slot in [&KB_HOOK, &MS_HOOK] {
+        let cur = slot.swap(0, Ordering::SeqCst);
+        if cur != 0 {
+            UnhookWindowsHookEx(cur as HHOOK);
+        }
+    }
+    sync_hooks(st);
 }
 
 fn need_raw() -> bool {
@@ -996,32 +1150,14 @@ fn need_raw() -> bool {
 /// Hooks are (re)installed fresh for each session, so even a hook Windows
 /// removed silently earlier is replaced.
 unsafe fn sync_hooks(st: &mut ServiceState) {
-    let hmod = GetModuleHandleW(null());
-    if need_hooks() {
-        if KB_HOOK.load(Ordering::SeqCst) == 0 {
-            let h = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), hmod, 0);
-            if h.is_null() {
-                crate::log_warn!("keyboard hook failed: error {}", GetLastError());
-            }
-            KB_HOOK.store(h as isize, Ordering::SeqCst);
-        }
-        if MS_HOOK.load(Ordering::SeqCst) == 0 {
-            let h = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), hmod, 0);
-            if h.is_null() {
-                crate::log_warn!("mouse hook failed: error {}", GetLastError());
-            }
-            MS_HOOK.store(h as isize, Ordering::SeqCst);
-        }
-    } else {
-        let k = KB_HOOK.swap(0, Ordering::SeqCst);
-        if k != 0 {
-            UnhookWindowsHookEx(k as HHOOK);
-        }
-        let m = MS_HOOK.swap(0, Ordering::SeqCst);
-        if m != 0 {
-            UnhookWindowsHookEx(m as HHOOK);
-        }
-    }
+    set_hook(
+        &KB_HOOK,
+        need_keyboard_hook(),
+        WH_KEYBOARD_LL,
+        Some(keyboard_proc),
+        "keyboard",
+    );
+    set_hook(&MS_HOOK, need_mouse_hook(), WH_MOUSE_LL, Some(mouse_proc), "mouse");
     let want_raw = need_raw();
     if want_raw != st.raw_registered {
         let dev = RAWINPUTDEVICE {
@@ -1060,6 +1196,10 @@ unsafe fn apply_hotkeys(st: &mut ServiceState) -> Vec<HotkeyRegistration> {
     for slot in HOTKEY_VKS.iter() {
         slot.store(0, Ordering::Relaxed);
     }
+    for d in HOTKEY_DEFS.iter() {
+        d.store(0, Ordering::Relaxed);
+    }
+    HOTKEYS_ENABLED.store(false, Ordering::Relaxed);
     let mut out = Vec::new();
     let Some(hk) = st.hotkeys.clone() else {
         return out;
@@ -1069,6 +1209,10 @@ unsafe fn apply_hotkeys(st: &mut ServiceState) -> Vec<HotkeyRegistration> {
         let h = a.of(&hk);
         let c = (h.vk & 0xFF) as usize;
         HOTKEY_VKS[c / 64].fetch_or(1u64 << (c % 64), Ordering::Relaxed);
+        let valid = h.validate().is_ok() && !seen.contains(&h);
+        if valid {
+            HOTKEY_DEFS[a.id() as usize - 1].store(pack_hotkey(&h), Ordering::Relaxed);
+        }
         let error = if st.suspended {
             None
         } else if let Err(e) = h.validate() {
@@ -1076,9 +1220,12 @@ unsafe fn apply_hotkeys(st: &mut ServiceState) -> Vec<HotkeyRegistration> {
         } else if seen.contains(&h) {
             Some("Same as another SentinelTask hotkey".into())
         } else if RegisterHotKey(st.hwnd, a.id(), hotkey_mods(&h), h.vk as u32) == 0 {
+            // Another program registered the same combination. Our keyboard
+            // hook still sees it first in most cases, but the other program
+            // will usually react too, so tell the user.
             let err = GetLastError();
             Some(if err == ERROR_HOTKEY_ALREADY_REGISTERED {
-                "Already used by another program — choose a different combination".into()
+                "Also used by another program — choose a different combination".into()
             } else {
                 format!("Windows refused this hotkey (error {err})")
             })
@@ -1092,6 +1239,7 @@ unsafe fn apply_hotkeys(st: &mut ServiceState) -> Vec<HotkeyRegistration> {
             error,
         });
     }
+    HOTKEYS_ENABLED.store(!st.suspended, Ordering::Relaxed);
     out
 }
 
@@ -1158,9 +1306,27 @@ unsafe extern "system" fn service_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, 
             handle_raw_input(lparam);
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
+        WM_APP_WAKE => {
+            wake_ui();
+            0
+        }
+        WM_TIMER if wparam == TIMER_REHOOK => {
+            STATE.with(|s| {
+                if let Ok(mut s) = s.try_borrow_mut() {
+                    if let Some(st) = s.as_mut() {
+                        refresh_hooks(st);
+                    }
+                }
+            });
+            0
+        }
         WM_APP_CMD => {
             STATE.with(|s| {
-                let mut s = s.borrow_mut();
+                // try_borrow: a panic here would abort the whole process.
+                let Ok(mut s) = s.try_borrow_mut() else {
+                    PostMessageW(hwnd, WM_APP_CMD, 0, 0);
+                    return;
+                };
                 if let Some(st) = s.as_mut() {
                     while let Ok(cmd) = st.cmd_rx.try_recv() {
                         match cmd {
@@ -1242,6 +1408,8 @@ impl Service {
                         raw_registered: false,
                     })
                 });
+                SERVICE_HWND.store(hwnd as isize, Ordering::SeqCst);
+                SetTimer(hwnd, TIMER_REHOOK, REHOOK_INTERVAL_MS, None);
                 let _ = hwnd_tx.send(hwnd as isize);
                 let mut msg: MSG = zeroed();
                 while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -1269,7 +1437,17 @@ impl Service {
         let (tx, rx) = crossbeam_channel::bounded(1);
         let _ = self.cmd_tx.send(Cmd::RegisterHotkeys(hk.clone(), tx));
         self.poke();
-        rx.recv_timeout(Duration::from_secs(3)).unwrap_or_default()
+        match rx.recv_timeout(Duration::from_secs(3)) {
+            Ok(r) => r,
+            Err(_) => HotkeyAction::ALL
+                .into_iter()
+                .map(|a| HotkeyRegistration {
+                    action: a,
+                    hotkey: a.of(hk),
+                    error: Some("SentinelTask's input service didn't respond — restart SentinelTask".into()),
+                })
+                .collect(),
+        }
     }
 
     /// Temporarily release our hotkeys (while the user is choosing a new one).
@@ -1418,5 +1596,312 @@ mod tests {
             assert!(n >= prev);
             prev = n;
         }
+    }
+}
+
+/// End-to-end tests against the real Windows input system. They send real
+/// (non-SentinelTask-tagged) input with `SendInput`, so they are ignored by
+/// default and run explicitly in CI on a Windows runner:
+/// `cargo test -p sentineltask -- --ignored --test-threads=1`.
+#[cfg(test)]
+mod real_windows {
+    use super::*;
+    use sentinel_core::keys::vk;
+
+    /// Simulate the *user* pressing keys (dwExtraInfo 0, not our tag).
+    fn user_key(code: u16, down: bool) {
+        let scan = unsafe { MapVirtualKeyW(code as u32, MAPVK_VK_TO_VSC) } as u16;
+        let i = INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: code,
+                    wScan: scan,
+                    dwFlags: if down { 0 } else { KEYEVENTF_KEYUP },
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        };
+        let n = unsafe { SendInput(1, &i, size_of::<INPUT>() as i32) };
+        assert_eq!(n, 1, "SendInput failed (no interactive desktop?)");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+
+    fn user_tap(code: u16) {
+        user_key(code, true);
+        user_key(code, false);
+    }
+
+    fn user_mouse(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: i32) {
+        let i = Injector::mouse_input(dx, dy, data as u32, flags);
+        let mut i = i;
+        i.Anonymous.mi.dwExtraInfo = 0;
+        let n = unsafe { SendInput(1, &i, size_of::<INPUT>() as i32) };
+        assert_eq!(n, 1, "SendInput (mouse) failed");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+
+    /// SendInput is asynchronous: wait (briefly) for the cursor to arrive.
+    fn wait_cursor(x: i32, y: i32) -> (i32, i32) {
+        for _ in 0..50 {
+            if cursor_pos() == (x, y) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        cursor_pos()
+    }
+
+    fn next_event(rx: &Receiver<PlatformEvent>, ms: u64) -> Option<PlatformEvent> {
+        rx.recv_timeout(Duration::from_millis(ms)).ok()
+    }
+
+    fn drain(rx: &Receiver<PlatformEvent>) {
+        while rx.try_recv().is_ok() {}
+    }
+
+    #[test]
+    #[ignore = "sends real input; run on a Windows desktop with --ignored"]
+    fn end_to_end() {
+        init_process();
+        let (svc, events, captured) = Service::start(std::sync::Arc::new(|| {}));
+        assert!(svc.is_functional(), "service window not created");
+        let hk = Hotkeys {
+            record: Hotkey::key(vk::F1 + 12),                      // F13
+            play: Hotkey::with(true, false, false, vk::F1 + 13),   // Ctrl+F14
+            pause: Hotkey::key(vk::F1 + 14),                       // F15
+            emergency_stop: Hotkey::key(vk::F1 + 15),              // F16
+            clicker: Hotkey::with(false, true, true, vk::F1 + 16), // Alt+Shift+F17
+        };
+        let regs = svc.register_hotkeys(&hk);
+        assert_eq!(regs.len(), 5);
+        for r in &regs {
+            assert!(r.error.is_none(), "{:?}: {:?}", r.action, r.error);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        drain(&events);
+
+        // 1. A single-key hotkey fires exactly once.
+        user_tap(vk::F1 + 12);
+        assert!(
+            matches!(
+                next_event(&events, 2000),
+                Some(PlatformEvent::Hotkey(HotkeyAction::Record))
+            ),
+            "F13 → Record"
+        );
+        assert!(next_event(&events, 400).is_none(), "Record fired twice");
+
+        // 2. Modifier hotkeys: right chord fires, wrong modifiers don't.
+        user_key(vk::LCONTROL, true);
+        user_tap(vk::F1 + 13);
+        user_key(vk::LCONTROL, false);
+        assert!(
+            matches!(
+                next_event(&events, 2000),
+                Some(PlatformEvent::Hotkey(HotkeyAction::Play))
+            ),
+            "Ctrl+F14 → Play"
+        );
+        user_tap(vk::F1 + 13); // without Ctrl
+        assert!(next_event(&events, 400).is_none(), "F14 alone must not trigger Play");
+        user_key(vk::LMENU, true);
+        user_key(vk::LSHIFT, true);
+        user_tap(vk::F1 + 16);
+        user_key(vk::LSHIFT, false);
+        user_key(vk::LMENU, false);
+        assert!(
+            matches!(
+                next_event(&events, 2000),
+                Some(PlatformEvent::Hotkey(HotkeyAction::Clicker))
+            ),
+            "Alt+Shift+F17 → Clicker"
+        );
+
+        // 3. Holding a hotkey (auto-repeat) fires once.
+        user_key(vk::F1 + 14, true);
+        user_key(vk::F1 + 14, true);
+        user_key(vk::F1 + 14, true);
+        user_key(vk::F1 + 14, false);
+        assert!(matches!(
+            next_event(&events, 2000),
+            Some(PlatformEvent::Hotkey(HotkeyAction::Pause))
+        ));
+        assert!(next_event(&events, 400).is_none(), "auto-repeat re-triggered Pause");
+        // ...and can be pressed again afterwards.
+        user_tap(vk::F1 + 14);
+        assert!(
+            matches!(
+                next_event(&events, 2000),
+                Some(PlatformEvent::Hotkey(HotkeyAction::Pause))
+            ),
+            "second press"
+        );
+
+        // 4. Choosing a new hotkey: chord captured, Esc cancels, hotkeys
+        //    suspended meanwhile.
+        svc.suspend_hotkeys(true);
+        svc.begin_key_capture(true);
+        std::thread::sleep(Duration::from_millis(150));
+        user_key(vk::LSHIFT, true);
+        user_tap(vk::F1 + 17); // F18
+        user_key(vk::LSHIFT, false);
+        match next_event(&events, 2000) {
+            Some(PlatformEvent::KeyCaptured(Some(h))) => {
+                assert_eq!(h, Hotkey::with(false, false, true, vk::F1 + 17), "captured chord")
+            }
+            other => panic!("expected captured Shift+F18, got {other:?}"),
+        }
+        svc.begin_key_capture(true);
+        std::thread::sleep(Duration::from_millis(150));
+        user_tap(vk::F1 + 12); // F13 = Record, but hotkeys are suspended
+        match next_event(&events, 2000) {
+            Some(PlatformEvent::KeyCaptured(Some(h))) => assert_eq!(h.vk, vk::F1 + 12),
+            other => panic!("suspended hotkey should be captured, got {other:?}"),
+        }
+        svc.begin_key_capture(true);
+        std::thread::sleep(Duration::from_millis(150));
+        user_tap(vk::ESCAPE);
+        assert!(
+            matches!(next_event(&events, 2000), Some(PlatformEvent::KeyCaptured(None))),
+            "Esc cancels"
+        );
+        svc.begin_key_capture(false);
+        svc.suspend_hotkeys(false);
+        std::thread::sleep(Duration::from_millis(200));
+        drain(&events);
+        user_tap(vk::F1 + 12);
+        assert!(
+            matches!(
+                next_event(&events, 2000),
+                Some(PlatformEvent::Hotkey(HotkeyAction::Record))
+            ),
+            "hotkeys back after capture"
+        );
+
+        // 5. Recording captures user input with scan codes and positions.
+        let desk = screen_info().desktop;
+        svc.set_capture(Some(CaptureConfig {
+            mouse_moves: true,
+            raw_deltas: true,
+            buttons: true,
+            keyboard: true,
+        }));
+        std::thread::sleep(Duration::from_millis(200));
+        while captured.try_recv().is_ok() {}
+        let (tx, ty) = (desk.x + 200, desk.y + 150);
+        let (ax, ay) = to_absolute(tx, ty, desk);
+        user_mouse(
+            MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+            ax,
+            ay,
+            0,
+        );
+        user_tap(vk::F1 + 18); // F19
+        user_mouse(MOUSEEVENTF_WHEEL, 0, 0, 120);
+        // Our own (tagged) injection must never be recorded.
+        let mut inj = Injector::new(MouseMode::Absolute);
+        inj.inject(
+            &EventKind::Key {
+                key: Key::from_vk(vk::F1 + 19), // F20
+                down: true,
+            },
+            false,
+        );
+        inj.release_all();
+        std::thread::sleep(Duration::from_millis(300));
+        svc.set_capture(None);
+        let got: Vec<EventKind> = captured.try_iter().map(|c| c.kind).collect();
+        assert!(
+            got.iter()
+                .any(|k| matches!(k, EventKind::MouseMove { x, y } if (*x - tx).abs() <= 1 && (*y - ty).abs() <= 1)),
+            "move to ({tx},{ty}) not recorded: {got:?}"
+        );
+        let f19: Vec<_> = got
+            .iter()
+            .filter_map(|k| match k {
+                EventKind::Key { key, down } if key.vk == vk::F1 + 18 => Some((*key, *down)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(f19.len(), 2, "F19 down+up: {got:?}");
+        assert!(f19[0].1 && !f19[1].1);
+        let sent_scan = unsafe { MapVirtualKeyW((vk::F1 + 18) as u32, MAPVK_VK_TO_VSC) } as u16;
+        assert_eq!(f19[0].0.scan, sent_scan, "scan code recorded as sent");
+        assert!(
+            got.iter().any(|k| matches!(
+                k,
+                EventKind::Wheel {
+                    delta: 120,
+                    horizontal: false,
+                    ..
+                }
+            )),
+            "wheel: {got:?}"
+        );
+        assert!(
+            !got.iter()
+                .any(|k| matches!(k, EventKind::Key { key, .. } if key.vk == vk::F1 + 19)),
+            "our own injected key was recorded"
+        );
+
+        // 6. Absolute positioning is pixel exact, including the far corner.
+        for (x, y) in [
+            (desk.x + 321, desk.y + 123),
+            (desk.x, desk.y),
+            (desk.right() - 1, desk.bottom() - 1),
+        ] {
+            inj.inject(&EventKind::MouseMove { x, y }, false);
+            assert_eq!(wait_cursor(x, y), (x, y), "cursor not at ({x},{y})");
+        }
+        drop(inj);
+
+        // 7. A full playback run: keys pressed and released, cursor ends at
+        //    the last position, nothing left held.
+        let events_ = vec![
+            sentinel_core::Event::new(
+                0,
+                EventKind::MouseMove {
+                    x: desk.x + 50,
+                    y: desk.y + 60,
+                },
+            ),
+            sentinel_core::Event::new(
+                10_000,
+                EventKind::Key {
+                    key: Key::from_vk(vk::F1 + 20), // F21
+                    down: true,
+                },
+            ),
+            sentinel_core::Event::new(
+                30_000,
+                EventKind::MouseMove {
+                    x: desk.x + 70,
+                    y: desk.y + 80,
+                },
+            ),
+        ];
+        let req = crate::engine::player::PlayRequest {
+            events: std::sync::Arc::new(events_),
+            opts: sentinel_core::PlaybackOptions {
+                repeat: sentinel_core::Repeat::Times { count: 2 },
+                ..Default::default()
+            },
+            recorded_screen: None,
+            focus_process: None,
+            countdown_secs: 0,
+            keep_awake: true,
+            wait_for_modifiers: true,
+        };
+        let status = crate::engine::player::start(req, std::sync::Arc::new(|| {})).join();
+        assert_eq!(
+            status.state,
+            crate::engine::player::RunState::Finished(crate::engine::player::FinishReason::Completed)
+        );
+        assert_eq!(status.injected, 6);
+        assert_eq!(wait_cursor(desk.x + 70, desk.y + 80), (desk.x + 70, desk.y + 80));
+        assert!(!key_down_now(vk::F1 + 20), "F21 left held down after playback");
+        assert!(GLOBAL_HELD.lock().is_none());
     }
 }

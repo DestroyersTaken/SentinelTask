@@ -27,6 +27,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
         run: cargo test --workspace
+      - name: Real-input end-to-end test (hotkeys, rebinding, recording, playback)
+        run: cargo test -p sentineltask -- --ignored --test-threads=1 --nocapture
       - name: Release build
         run: cargo build --release
       - name: Smoke test

@@ -477,7 +477,16 @@ impl SentinelApp {
         if let Mode::Recording { session, .. } = &mut self.mode {
             let mut meaningful = false;
             while let Ok(c) = self.capture_rx.try_recv() {
-                meaningful |= session.push(c);
+                // Clicks and scrolls on SentinelTask itself (e.g. its Stop
+                // button) are never part of a macro.
+                let on_us = match c.kind {
+                    sentinel_core::EventKind::MouseButton { x, y, .. }
+                    | sentinel_core::EventKind::Wheel { x, y, .. } => platform::point_is_own_window(x, y),
+                    _ => false,
+                };
+                if !on_us {
+                    meaningful |= session.push(c);
+                }
             }
             if meaningful && session.target.is_none() && want_target {
                 if let Some(w) = platform::foreground_window() {
@@ -698,16 +707,7 @@ impl SentinelApp {
                         handle.abort_for_activity(what);
                     }
                 }
-                PlatformEvent::KeyCaptured(result) => {
-                    if let Some(action) = self.capturing_hotkey.take() {
-                        self.service.suspend_hotkeys(false);
-                        if let Some(hk) = result {
-                            self.set_hotkey(action, hk);
-                        } else {
-                            self.reregister_hotkeys();
-                        }
-                    }
-                }
+                PlatformEvent::KeyCaptured(result) => self.finish_key_capture(result),
                 PlatformEvent::PointPicked(p) => {
                     self.picking_point = false;
                     if let Some((x, y)) = p {
@@ -717,6 +717,34 @@ impl SentinelApp {
                     }
                 }
             }
+        }
+    }
+
+    /// Start choosing a new key for `action` (Settings).
+    pub fn begin_key_capture(&mut self, action: HotkeyAction) {
+        self.capturing_hotkey = Some(action);
+        self.service.suspend_hotkeys(true);
+        self.service.begin_key_capture(true);
+    }
+
+    /// End hotkey choosing. `None` cancels. Safe to call more than once —
+    /// the system hook and the in-window fallback may both report.
+    pub fn finish_key_capture(&mut self, result: Option<Hotkey>) {
+        let Some(action) = self.capturing_hotkey.take() else {
+            return;
+        };
+        self.service.begin_key_capture(false);
+        self.service.suspend_hotkeys(false);
+        match result {
+            Some(hk) => self.set_hotkey(action, hk),
+            None => self.reregister_hotkeys(),
+        }
+    }
+
+    pub fn cancel_point_pick(&mut self) {
+        if self.picking_point {
+            self.picking_point = false;
+            self.service.begin_point_pick(false);
         }
     }
 

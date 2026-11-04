@@ -222,3 +222,7 @@ pub fn console_interrupted() -> bool {
 }
 
 pub fn set_virtual_key_injection(_on: bool) {}
+
+pub fn point_is_own_window(_x: i32, _y: i32) -> bool {
+    false
+}
