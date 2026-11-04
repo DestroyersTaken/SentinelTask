@@ -73,7 +73,24 @@ atbswp issues (#76 infinite loops on exported executables, #91 held buttons,
   extended. Mouse: `paramL`/`paramH` = x/y. Wheel: `paramH` = signed delta.
   `time` is a `GetTickCount` value (may wrap).
 
-## 4. Responsible use
+## 4. Lessons from testing the real Windows build
+
+Found by driving the actual `SentinelTask.exe` (real keystrokes, a real
+window manager, GitHub's Windows runners) rather than unit tests alone:
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Record hotkey (Ctrl+Alt+Shift+R) did nothing for some users | GPU overlays (e.g. the NVIDIA App's Alt+R) grab the keystroke with their own low-level hook before `RegisterHotKey` sees it | Hotkeys are also detected by SentinelTask's own keyboard hook, which Windows calls first (newest hook first); the matched key is swallowed so it never fires twice |
+| No hotkey worked — not even the emergency stop — while SentinelTask was minimized | eframe doesn't run the UI pass for a minimized window, and event handling lived there | All non-drawing work runs in `App::logic`, which also runs while minimized |
+| Crash when minimizing during playback | The status overlay was an *immediate* viewport; eframe panics if it can't create it during a hidden pass | Overlay is a *deferred* viewport drawing from shared state |
+| Keystrokes went to the status overlay after minimizing | Windows activates the next window in z-order — the always-on-top overlay | Overlay is `WS_EX_NOACTIVATE \| WS_EX_TOOLWINDOW`; it never counts as "SentinelTask in front" |
+| A stray Alt press at the end of macros | The stop chord's modifier key-ups were recorded before the UI reacted | Capture stops inside the hook the instant a stop hotkey is pressed; chord stripping also removes a released chord |
+| Clicks sometimes landed at the previous position | `SendInput` is asynchronous; reading the cursor right after a move is racy | The click carries its own position; a separate move goes first in the same `SendInput` call (games such as Roblox need to see the cursor arrive) |
+| Compact mode stayed full-size | A single resize request can be undone by the DPI adjustment after the window appears, or by a maximized/snapped window | Window is created at the right size; the size is verified every frame and the request repeated until it sticks |
+| Rebinding a hotkey could get stuck on "press keys" | The system hook path had no fallback and no way out | Cancel button, Esc, and a fallback that reads keys from SentinelTask's own window |
+| Fast double-press of a hotkey counted once | The duplicate guard merged genuine presses | Only the *same* press arriving via both detection paths is merged |
+
+## 5. Responsible use
 
 SentinelTask automates *your own* mouse and keyboard. Many online games
 prohibit automation in their terms of service; SentinelTask does not include

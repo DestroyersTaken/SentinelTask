@@ -133,6 +133,26 @@ Cross-compiling from Linux works with MinGW
 systems the app builds with a stub backend that shows the UI but records and
 plays nothing — useful for development.
 
+### Testing
+
+Every push runs, on GitHub's real Windows machines:
+
+- **Unit tests** for the engine (scheduler, coordinates, file formats,
+  recording clean-up, editing) and **stress/fuzz tests**: hundreds of
+  random recordings, edits and playback settings, thousands of corrupted
+  files, and a one-hour 1000 Hz recording (3.6 million events).
+- A **real-input end-to-end test** that sends actual keystrokes and mouse
+  input: hotkeys fire exactly once (and not with the wrong modifiers),
+  rebinding and Esc, recording keys/clicks/wheel with scan codes, our own
+  input never being recorded, pixel-exact positioning, and a full playback
+  that leaves nothing held down.
+- A **GUI self-test** that drives the real app through 15 scenarios —
+  hotkeys while minimized, emergency stop, pause/resume, loop accuracy,
+  rebinding the Record hotkey, the auto-clicker, compact mode, file
+  save/open/rename/import/export and settings — and fails the build if
+  any of them breaks. Run it yourself with
+  `SENTINEL_SELFTEST=result.txt SentinelTask.exe`.
+
 ### Project layout
 
 | Path | What's there |
